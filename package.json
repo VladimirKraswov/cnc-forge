@@ -4,6 +4,9 @@
   "main": "index.js",
   "license": "MIT",
   "private": true,
+  "scripts": {
+    "build": "npm run build -w core && npm run build -w gui"
+  },
   "workspaces": [
     "core",
     "gui"

@@ -8,6 +8,35 @@
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
   },
+  "scripts": {
+    "build": "vite build --config vite.main.config.ts",
+    "start": "npm run build && concurrently \"vite\" \"electron .\"",
+    "package": "npm run build && electron-builder",
+    "package:win": "npm run package -- --win",
+    "package:mac": "npm run package -- --mac",
+    "package:linux": "npm run package -- --linux"
+  },
+  "build": {
+    "appId": "com.cncforge.gui",
+    "productName": "CncForge",
+    "directories": {
+      "output": "dist/builder"
+    },
+    "files": [
+      "dist/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "deb"
+    }
+  },
   "devDependencies": {
     "@types/electron": "^1.6.12",
     "@types/react": "^19.2.7",
