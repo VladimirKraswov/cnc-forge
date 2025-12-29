@@ -1,5 +1,8 @@
-import { app, BrowserWindow } from 'electron';
+// gui/main.ts
+import { app, BrowserWindow, ipcMain } from 'electron';
 import * as path from 'path';
+import * as url from 'url';
+import { SerialPort } from 'serialport';
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection:', reason);
@@ -19,9 +22,22 @@ function createWindow() {
   if (isDev) {
     win.loadURL('http://localhost:5173').catch(console.error);
   } else {
-    win.loadFile(path.join(__dirname, 'renderer/index.html')).catch(console.error);
+    win.loadURL(url.format({
+      pathname: path.join(__dirname, 'renderer/index.html'),
+      protocol: 'file:',
+      slashes: true,
+    })).catch(console.error);
   }
 }
+
+ipcMain.handle('getPorts', async () => {
+  try {
+    return await SerialPort.list();
+  } catch (err) {
+    console.error('IPC error:', err);
+    return [];
+  }
+});
 
 app.whenReady().then(() => {
   createWindow();

@@ -1,6 +1,3 @@
-// Импортируем только типы, которые не будем объявлять здесь
-import { EventEmitter } from 'eventemitter3';
-
 // GRBL Status - базовый интерфейс для парсинга статуса GRBL
 export interface IGrblStatus {
   state: string; // e.g., 'Idle', 'Run', 'Alarm'
@@ -17,18 +14,24 @@ export enum ConnectionType {
 }
 
 // Basic connection interfaces (упрощенные)
-export interface IConnection extends EventEmitter {
+export interface IConnection {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   send(data: string): Promise<void>;
   readonly isConnected: boolean;
   
-  // EventEmitter методы
+  // EventEmitter методы (без импорта, так как extends EventEmitter от 'events')
   on(event: 'connected', listener: () => void): this;
   on(event: 'disconnected', listener: () => void): this;
   on(event: 'data', listener: (data: string) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this;
+  
+  once(event: 'connected', listener: () => void): this;
+  once(event: 'disconnected', listener: () => void): this;
+  once(event: 'data', listener: (data: string) => void): this;
+  once(event: 'error', listener: (error: Error) => void): this;
+  once(event: string | symbol, listener: (...args: any[]) => void): this;
   
   off(event: string | symbol, listener: (...args: any[]) => void): this;
   removeAllListeners(event?: string | symbol): this;

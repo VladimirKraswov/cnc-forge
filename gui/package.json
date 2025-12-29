@@ -4,9 +4,12 @@
   "main": "dist/main.js",
   "license": "MIT",
   "dependencies": {
+    "@mui/material": "^7.3.6",
+    "@reduxjs/toolkit": "^2.11.2",
     "electron": "^39.2.7",
     "react": "^19.2.3",
-    "react-dom": "^19.2.3"
+    "react-dom": "^19.2.3",
+    "react-redux": "^9.2.0"
   },
   "scripts": {
     "build:main": "vite build --config vite.main.config.ts",

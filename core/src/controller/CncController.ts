@@ -1,4 +1,4 @@
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'events';
 import {
   IConnection,
   IConnectionOptions,
@@ -8,6 +8,23 @@ import {
 } from '../types';
 import fs from 'fs/promises';
 import { ConnectionFactory } from '../connections';
+
+// Определяем расширенные интерфейсы для зондирования
+interface IProbeResultExtended extends IProbeResult {
+  success: boolean;
+  axis: string;
+  distance: number;
+  feedRate: number;
+  rawResponse: string;
+  error?: string;
+}
+
+interface IGridProbeResult extends IProbeResultExtended {
+  gridPosition?: {
+    x: number;
+    y: number;
+  };
+}
 
 export class CncController extends EventEmitter {
   private connection: IConnection | null = null;
@@ -66,26 +83,27 @@ export class CncController extends EventEmitter {
 
     this.responseBuffer = '';
 
-    return new Promise(async (resolve, reject) => {
-      try {
-        await this.connection!.send(command + '\n');
-        this.responsePromise = { resolve, reject };
+    return new Promise<string>((resolve, reject) => {
+      const wrappedResolve = (value: string) => {
+        clearTimeout(timeoutId);
+        resolve(value);
+      };
 
-        const timeoutId = setTimeout(() => {
-          if (this.responsePromise) {
-            this.responsePromise.reject(new Error('Response timeout'));
-            this.responsePromise = null;
-          }
-        }, timeout);
+      this.responsePromise = { resolve: wrappedResolve, reject };
 
-        const originalResolve = this.responsePromise.resolve;
-        this.responsePromise.resolve = (value: string) => {
-          clearTimeout(timeoutId);
-          originalResolve(value);
-        };
-      } catch (error) {
-        reject(error as Error);
-      }
+      this.connection!.send(command + '\n').catch((error) => {
+        if (this.responsePromise) {
+          this.responsePromise.reject(error);
+          this.responsePromise = null;
+        }
+      });
+
+      const timeoutId = setTimeout(() => {
+        if (this.responsePromise) {
+          this.responsePromise.reject(new Error('Response timeout'));
+          this.responsePromise = null;
+        }
+      }, timeout);
     });
   }
 
@@ -97,9 +115,9 @@ export class CncController extends EventEmitter {
 
     if (
       this.responsePromise &&
-      (trimmedData.includes('ok') ||
-        trimmedData.includes('error') ||
-        trimmedData.includes('alarm'))
+      (this.responseBuffer.includes('ok') ||
+        this.responseBuffer.includes('error') ||
+        this.responseBuffer.includes('alarm'))
     ) {
       const response = this.responseBuffer.trim();
       this.responsePromise.resolve(response);
@@ -146,11 +164,7 @@ export class CncController extends EventEmitter {
     if (match) {
       return {
         state: match[1],
-        position: {
-          x: parseFloat(match[2]),
-          y: parseFloat(match[3]),
-          z: parseFloat(match[4]),
-        },
+        position: { x: parseFloat(match[2]), y: parseFloat(match[3]), z: parseFloat(match[4]) },
         feed: match[5] ? parseFloat(match[5]) : undefined,
       };
     }
@@ -169,7 +183,6 @@ export class CncController extends EventEmitter {
     this.statusPollingIntervalId = setInterval(async () => {
       if (this.isConnected()) {
         try {
-          // getStatus already emits a 'status' event, so we don't need to do it again here.
           await this.sendCommand('?');
         } catch (error) {
           // Don't emit errors for polling
@@ -245,60 +258,8 @@ export class CncController extends EventEmitter {
     this.emit('jobComplete');
   }
 
-  async probe(
-    axis: 'Z' = 'Z',
-    feed: number = 100,
-    distance: number = -100
-  ): Promise<IProbeResult> {
-    const response = await this.sendCommand(
-      `G38.2 ${axis}${distance} F${feed}`
-    );
-    const match = response.match(/\[PRB:([\d.-]+),([\d.-]+),([\d.-]+):(\d)\]/);
-
-    if (match) {
-      const result: IProbeResult = {
-        x: parseFloat(match[1]),
-        y: parseFloat(match[2]),
-        z: parseFloat(match[3]),
-      };
-      this.emit('probeComplete', result);
-      return result;
-    }
-
-    throw new Error('Failed to parse probe result');
-  }
-
-  async probeGrid(
-    gridSize: { x: number; y: number },
-    step: number,
-    feed: number = 100
-  ): Promise<IProbeResult[]> {
-    const results: IProbeResult[] = [];
-    const status = await this.getStatus();
-    const startX = status.position.x;
-    const startY = status.position.y;
-
-    for (let y = 0; y <= gridSize.y; y += step) {
-      for (let x = 0; x <= gridSize.x; x += step) {
-        const targetX = startX + x;
-        const targetY = startY + y;
-        await this.sendCommand(`G0 X${targetX} Y${targetY}`);
-
-        const probeResult = await this.probe('Z', feed);
-        results.push(probeResult);
-
-        await this.sendCommand('G91 G0 Z5'); // Retract 5mm
-        await this.sendCommand('G90'); // Absolute positioning
-      }
-    }
-
-    this.emit('probeGridComplete', results);
-    return results;
-  }
-
   async stopJob(): Promise<string> {
-    await this.connection?.send('!');
-    return 'Feed hold activated';
+    return this.sendCommand('!');
   }
 
   async softReset(): Promise<void> {
@@ -320,5 +281,116 @@ export class CncController extends EventEmitter {
     const result = await this.sendCommand(gcode);
     await this.sendCommand('$C');
     return result;
+  }
+
+  async probe(axis: string, feedRate: number, distance: number): Promise<IProbeResultExtended> {
+    if (!this.connection || !this.isConnected()) {
+      throw new Error('Not connected');
+    }
+
+    // Send probe command to GRBL
+    // Format: G38.2 Z-100 F100 for Z-axis probing
+    const command = `G38.2 ${axis.toUpperCase()}${distance} F${feedRate}`;
+    try {
+      const response = await this.sendCommand(command);
+      
+      // Get final position after probing
+      await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
+      const status = await this.getStatus();
+      
+      return {
+        x: status.position.x,
+        y: status.position.y,
+        z: status.position.z,
+        success: response.includes('ok') && !response.includes('error'),
+        axis: axis.toUpperCase(),
+        distance: distance,
+        feedRate: feedRate,
+        rawResponse: response
+      };
+    } catch (error) {
+      const errorMsg = (error as Error).message;
+      if (errorMsg.includes('Probe fail') || errorMsg.includes('ALARM:4') || errorMsg.includes('ALARM:5')) {
+        return {
+          x: 0,
+          y: 0,
+          z: 0,
+          success: false,
+          axis: axis.toUpperCase(),
+          distance: distance,
+          feedRate: feedRate,
+          rawResponse: errorMsg,
+          error: 'Probe failed to contact workpiece'
+        };
+      }
+      throw error;
+    }
+  }
+
+  async probeGrid(
+    gridSize: { x: number; y: number },
+    stepSize: number,
+    feedRate: number
+  ): Promise<IGridProbeResult[]> {
+    if (!this.connection || !this.isConnected()) {
+      throw new Error('Not connected');
+    }
+
+    const results: IGridProbeResult[] = [];
+    const startX = -gridSize.x / 2;
+    const startY = -gridSize.y / 2;
+    
+    // First, move to safe height
+    await this.sendCommand('G0 Z10');
+    await this.sendCommand('G0 X0 Y0'); // Start at center
+    
+    for (let y = 0; y <= gridSize.y; y += stepSize) {
+      for (let x = 0; x <= gridSize.x; x += stepSize) {
+        // Move to position
+        const targetX = startX + x;
+        const targetY = startY + y;
+        await this.sendCommand(`G0 X${targetX} Y${targetY}`);
+        
+        // Probe Z at this position
+        try {
+          const probeResult = await this.probe('Z', feedRate, -100);
+          const gridProbeResult: IGridProbeResult = {
+            ...probeResult,
+            gridPosition: { x: targetX, y: targetY }
+          };
+          results.push(gridProbeResult);
+          
+          // Raise probe after each point
+          await this.sendCommand('G0 Z10');
+        } catch (error) {
+          console.error(`Probe failed at X${targetX} Y${targetY}:`, error);
+          // Add failed result with grid position
+          const failedResult: IGridProbeResult = {
+            x: 0,
+            y: 0,
+            z: 0,
+            success: false,
+            axis: 'Z',
+            distance: -100,
+            feedRate: feedRate,
+            rawResponse: (error as Error).message,
+            error: 'Probe failed',
+            gridPosition: { x: targetX, y: targetY }
+          };
+          results.push(failedResult);
+          
+          // Continue with next point
+          await this.sendCommand('G0 Z10');
+        }
+        
+        // Small delay between points
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+    
+    // Return to start position
+    await this.sendCommand('G0 X0 Y0 Z10');
+    
+    return results;
   }
 }

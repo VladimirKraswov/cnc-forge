@@ -1,12 +1,12 @@
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'events';
 import { IConnection, ConnectionConfig } from '../types';
 
-export abstract class BaseConnection<T extends ConnectionConfig = ConnectionConfig> 
-  extends EventEmitter 
-  implements IConnection 
+export abstract class BaseConnection<T extends ConnectionConfig = ConnectionConfig>
+  extends EventEmitter
+  implements IConnection
 {
   protected _isConnected: boolean = false;
-  protected config: T; // Теперь config имеет тип T
+  protected config: T;
 
   constructor(config: T) {
     super();
@@ -39,7 +39,7 @@ export abstract class BaseConnection<T extends ConnectionConfig = ConnectionConf
     this.emit('error', error);
   }
 
-  // EventEmitter методы с типизацией
+  // Типизация методов EventEmitter
   public on(event: 'connected', listener: () => void): this;
   public on(event: 'disconnected', listener: () => void): this;
   public on(event: 'data', listener: (data: string) => void): this;
