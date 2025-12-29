@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 import path from 'path';
 
-// https://vitejs.dev/config/
+// vite.main.config.ts - for main and preload
 export default defineConfig({
   build: {
     outDir: 'dist',
@@ -10,7 +10,7 @@ export default defineConfig({
       formats: ['cjs'],
     },
     rollupOptions: {
-      external: ['electron'],
+      external: ['electron', 'events', 'path'],
     },
   },
   resolve: {
