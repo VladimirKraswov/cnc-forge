@@ -1,12 +1,12 @@
 # CncForge
 Многофункциональная программа управления CNC-станком на GRBL/ESP32.
 ## Установка
-npm install
+yarn install
 ## Запуск CLI
-npm run cli -w core
+yarn workspace core cli
 ## Запуск GUI
-npm start -w gui
+yarn workspace gui start
 ## Сборка проекта
-npm run build
+yarn build
 ## Сборка дистрибутива
-npm run package -w gui
+yarn workspace gui package
