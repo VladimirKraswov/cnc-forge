@@ -1,16 +1,11 @@
 import { EventEmitter } from 'events';
-import {
-  IConnection,
-  IConnectionOptions,
-  IGrblStatus,
-  IProbeResult,
-  IAlarm,
-} from '../types';
+import { IGrblStatus, IAlarm, IPosition } from '../types';
+import { IConnection, IConnectionOptions } from '../interfaces/Connection';
 import fs from 'fs/promises';
 import { ConnectionFactory } from '../connections';
 
 // Определяем расширенные интерфейсы для зондирования
-interface IProbeResultExtended extends IProbeResult {
+interface IProbeResultExtended extends IPosition {
   success: boolean;
   axis: string;
   distance: number;
@@ -34,32 +29,34 @@ export class CncController extends EventEmitter {
     resolve: (value: string) => void;
     reject: (error: Error) => void;
   } | null = null;
-  private statusPollingIntervalId: NodeJS.Timeout | null = null;
+  private statusPollingIntervalId: any | null = null;
 
   async connect(options: IConnectionOptions): Promise<void> {
     try {
       this.connection = ConnectionFactory.create(options);
 
-      this.connection.on('connected', () => {
-        this.connected = true;
-        this.emit('connected');
-      });
+      if (this.connection) {
+        this.connection.on('connected', () => {
+          this.connected = true;
+          this.emit('connected');
+        });
 
-      this.connection.on('disconnected', () => {
-        this.connected = false;
-        this.emit('disconnected');
-        this.stopStatusPolling();
-      });
+        this.connection.on('disconnected', () => {
+          this.connected = false;
+          this.emit('disconnected');
+          this.stopStatusPolling();
+        });
 
-      this.connection.on('data', (data: string) => {
-        this.handleIncomingData(data);
-      });
+        this.connection.on('data', (data: string) => {
+          this.handleIncomingData(data);
+        });
 
-      this.connection.on('error', (error: Error) => {
-        this.emit('error', error);
-      });
+        this.connection.on('error', (error: Error) => {
+          this.emit('error', error);
+        });
 
-      await this.connection.connect();
+        await this.connection.connect();
+      }
     } catch (error) {
       throw new Error(`Connection error: ${(error as Error).message}`);
     }
@@ -84,6 +81,7 @@ export class CncController extends EventEmitter {
     this.responseBuffer = '';
 
     return new Promise<string>((resolve, reject) => {
+      let timeoutId: NodeJS.Timeout;
       const wrappedResolve = (value: string) => {
         clearTimeout(timeoutId);
         resolve(value);
@@ -91,14 +89,14 @@ export class CncController extends EventEmitter {
 
       this.responsePromise = { resolve: wrappedResolve, reject };
 
-      this.connection!.send(command + '\n').catch((error) => {
+      this.connection!.send(command + '\n').catch((error: Error) => {
         if (this.responsePromise) {
           this.responsePromise.reject(error);
           this.responsePromise = null;
         }
       });
 
-      const timeoutId = setTimeout(() => {
+      timeoutId = setTimeout(() => {
         if (this.responsePromise) {
           this.responsePromise.reject(new Error('Response timeout'));
           this.responsePromise = null;
@@ -163,7 +161,7 @@ export class CncController extends EventEmitter {
     );
     if (match) {
       return {
-        state: match[1],
+        state: match[1] as IGrblStatus['state'],
         position: { x: parseFloat(match[2]), y: parseFloat(match[3]), z: parseFloat(match[4]) },
         feed: match[5] ? parseFloat(match[5]) : undefined,
       };
@@ -259,7 +257,11 @@ export class CncController extends EventEmitter {
   }
 
   async stopJob(): Promise<string> {
-    return this.sendCommand('!');
+    if (!this.connection || !this.isConnected()) {
+      throw new Error('Not connected');
+    }
+    this.connection.send('!');
+    return Promise.resolve('');
   }
 
   async softReset(): Promise<void> {
