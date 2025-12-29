@@ -243,3 +243,14 @@ export interface MotionConfig {
   acceleration: number;
   jerk: number;
 }
+
+export interface IProbeResult {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface IAlarm {
+  code: number;
+  message: string;
+}

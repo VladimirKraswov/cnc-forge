@@ -1,202 +1,235 @@
-import { ConnectionType } from '../src';
 import { CncController } from '../src/controller/CncController';
+import { IConnection, IConnectionOptions, ConnectionType } from '../src/types';
+import { EventEmitter } from 'eventemitter3';
 import fs from 'fs/promises';
 
-// Очень простой mock для SerialPort
-jest.mock('serialport', () => ({
-  SerialPort: jest.fn().mockImplementation(() => {
-    // Создаем простой объект-заглушку
-    const stub: any = {
-      on: jest.fn((event: string, callback: Function): any => {
-        if (event === 'open') {
-          // Вызываем callback асинхронно
-          setTimeout(callback, 0);
-        }
-        return stub;
-      }),
-      
-      write: jest.fn((data: string | Buffer, cb?: (err: Error | null) => void): any => {
-        if (cb) cb(null);
-        return stub;
-      }),
-      
-      close: jest.fn((cb?: (err: Error | null) => void): any => {
-        if (cb) cb(null);
-        return stub;
-      }),
-      
-      removeListener: jest.fn(),
-    };
-    
-    return stub;
-  }),
+// Mock the ConnectionFactory and IConnection
+jest.mock('../src/connections', () => ({
+  ConnectionFactory: {
+    create: jest.fn(),
+  },
 }));
 
-// Мокаем fs.promises
+// Mock fs/promises
 jest.mock('fs/promises', () => ({
-  readFile: jest.fn().mockResolvedValue('G1 X10\nG1 Y20'),
+  readFile: jest.fn(),
 }));
+
+class MockConnection extends EventEmitter implements IConnection {
+  isConnected: boolean = false;
+
+  connect = jest.fn(async () => {
+    this.isConnected = true;
+    this.emit('connected');
+  });
+
+  disconnect = jest.fn(async () => {
+    this.isConnected = false;
+    this.emit('disconnected');
+  });
+
+  send = jest.fn(async (data: string) => {
+    // Simulate GRBL response
+    setTimeout(() => this.emit('data', 'ok'), 10);
+  });
+
+  // Add other methods if needed by IConnection
+}
 
 describe('CncController', () => {
   let controller: CncController;
+  let mockConnection: MockConnection;
 
   beforeEach(() => {
-    controller = new CncController();
+    // Reset mocks before each test
     jest.clearAllMocks();
+
+    mockConnection = new MockConnection();
+
+    // Make ConnectionFactory return our mock
+    const { ConnectionFactory } = require('../src/connections');
+    ConnectionFactory.create.mockReturnValue(mockConnection);
+
+    controller = new CncController();
   });
 
   afterEach(() => {
-    jest.restoreAllMocks();
+    // Restore real timers after each test to prevent interference
+    jest.useRealTimers();
   });
 
-  it('должен создаваться и быть не соединённым по умолчанию', () => {
-    expect(controller).toBeDefined();
-    expect(controller).toBeInstanceOf(CncController);
-    expect(controller.isConnected()).toBe(false);
-  });
+  it('should connect and disconnect', async () => {
+    const options: IConnectionOptions = { type: ConnectionType.Serial, port: '/dev/test' };
 
-  it('должен устанавливать соединение', async () => {
-    await expect(controller.connect({
-      port: '/dev/test', baudRate: 115200,
-      type: ConnectionType.Serial
-    })).resolves.toBeUndefined();
+    await controller.connect(options);
+    expect(mockConnection.connect).toHaveBeenCalled();
     expect(controller.isConnected()).toBe(true);
-  });
 
-  it('должен отключаться', async () => {
-    await controller.connect({
-      port: '/dev/test', baudRate: 115200,
-      type: ConnectionType.Serial
-    });
-    await expect(controller.disconnect()).resolves.toBeUndefined();
+    await controller.disconnect();
+    expect(mockConnection.disconnect).toHaveBeenCalled();
     expect(controller.isConnected()).toBe(false);
   });
 
-  // Убираем тест sendCommand напрямую - он слишком сложный для мока
-  // Вместо этого фокусируемся на тестировании публичных методов
-  
-  describe('публичные методы с mocked sendCommand', () => {
-    let sendCommandSpy: jest.SpyInstance;
+  it('should send a command and receive a response', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
     
-    beforeEach(async () => {
-      await controller.connect({
-        port: '/dev/test', baudRate: 115200,
-        type: ConnectionType.Serial
-      });
-      sendCommandSpy = jest.spyOn(controller as any, 'sendCommand');
-    });
+    const promise = controller.sendCommand('G0 X10');
     
-    afterEach(() => {
-      sendCommandSpy.mockRestore();
-    });
+    // Simulate response
+    setTimeout(() => mockConnection.emit('data', 'ok'), 50);
     
-    it('getStatus должен парсить статус', async () => {
-      sendCommandSpy.mockResolvedValue('<Idle|MPos:10.000,20.000,5.000|F:100>');
-      
-      const status = await controller.getStatus();
-      
-      expect(status).toEqual({
-        state: 'Idle',
-        position: { x: 10, y: 20, z: 5 },
-        feed: 100,
-      });
-      expect(sendCommandSpy).toHaveBeenCalledWith('?');
+    await expect(promise).resolves.toBe('ok');
+    expect(mockConnection.send).toHaveBeenCalledWith('G0 X10\n');
+  });
+
+  it('should get status', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+
+    mockConnection.send.mockImplementation(async (data: string) => {
+      if (data === '?\n') {
+        setTimeout(() => mockConnection.emit('data', '<Idle|MPos:10,20,30|F:100>'), 10);
+      }
     });
 
-    it('home должен отправлять $H', async () => {
-      sendCommandSpy.mockResolvedValue('ok');
-      
-      const response = await controller.home();
-      
-      expect(response).toBe('ok');
-      expect(sendCommandSpy).toHaveBeenCalledWith('$H');
-    });
-
-    it('jog должен отправлять команду для оси X', async () => {
-      sendCommandSpy.mockResolvedValue('ok');
-      
-      const response = await controller.jog('X', 10, 100);
-      
-      expect(response).toBe('ok');
-      expect(sendCommandSpy).toHaveBeenCalledWith('$J=G91 X10 F100');
-    });
-
-    it('jog должен отправлять команду для оси Y', async () => {
-      sendCommandSpy.mockResolvedValue('ok');
-      
-      const response = await controller.jog('Y', -5, 50);
-      
-      expect(response).toBe('ok');
-      expect(sendCommandSpy).toHaveBeenCalledWith('$J=G91 Y-5 F50');
-    });
-
-    it('jog должен отправлять команду для оси Z', async () => {
-      sendCommandSpy.mockResolvedValue('ok');
-      
-      const response = await controller.jog('Z', 2.5, 30);
-      
-      expect(response).toBe('ok');
-      expect(sendCommandSpy).toHaveBeenCalledWith('$J=G91 Z2.5 F30');
-    });
-
-    it('jog должен выбрасывать ошибку для неверной оси', async () => {
-      await expect(controller.jog('A' as any, 10, 100))
-        .rejects.toThrow('Неверная ось: должна быть X, Y или Z');
-    });
-
-    it('streamGCode должен обрабатывать G-code из строки', async () => {
-      sendCommandSpy.mockResolvedValue('ok');
-      
-      await controller.streamGCode('G1 X10\nG1 Y20\n; comment');
-      
-      expect(sendCommandSpy).toHaveBeenCalledTimes(2);
-      expect(sendCommandSpy).toHaveBeenNthCalledWith(1, 'G1 X10');
-      expect(sendCommandSpy).toHaveBeenNthCalledWith(2, 'G1 Y20');
-    });
-
-    it('streamGCode должен обрабатывать G-code из файла', async () => {
-      sendCommandSpy.mockResolvedValue('ok');
-      
-      await controller.streamGCode('test.gcode', true);
-      
-      expect(fs.readFile).toHaveBeenCalledWith('test.gcode', 'utf8');
-      expect(sendCommandSpy).toHaveBeenCalledTimes(2);
-    });
-
-    it('streamGCode должен выбрасывать ошибку при error ответе', async () => {
-      sendCommandSpy.mockResolvedValue('error: Invalid command');
-      
-      await expect(controller.streamGCode('G1 X10'))
-        .rejects.toThrow(/Ошибка при отправке G-code/);
-    });
-
-    it('streamGCode должен выбрасывать ошибку при alarm ответе', async () => {
-      sendCommandSpy.mockResolvedValue('alarm: Hard limit');
-      
-      await expect(controller.streamGCode('G1 X10'))
-        .rejects.toThrow(/Ошибка при отправке G-code/);
-    });
-    
-    it('streamGCode должен обрабатывать ошибку чтения файла', async () => {
-      (fs.readFile as jest.Mock).mockRejectedValueOnce(new Error('File not found'));
-      
-      await expect(controller.streamGCode('bad/file.gcode', true))
-        .rejects.toThrow('Ошибка чтения файла');
+    const status = await controller.getStatus();
+    expect(status).toEqual({
+      state: 'Idle',
+      position: { x: 10, y: 20, z: 30 },
+      feed: 100,
     });
   });
-  
-  // Отдельный тест для проверки, что getStatus выбрасывает ошибку при некорректном ответе
-  it('getStatus должен выбрасывать ошибку при некорректном ответе', async () => {
-    await controller.connect({
-      port: '/dev/test', baudRate: 115200,
-      type: ConnectionType.Serial
+
+  it('should start and stop status polling', async () => {
+    jest.useFakeTimers();
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+
+    const statusHandler = jest.fn();
+    controller.on('status', statusHandler);
+
+    mockConnection.send.mockImplementation(async (data: string) => {
+      if (data === '?\n') {
+        process.nextTick(() => mockConnection.emit('data', '<Idle|MPos:0,0,0|F:0>ok'));
+      }
     });
+
+    controller.startStatusPolling(100);
+
+    // Run the first interval
+    await jest.runOnlyPendingTimersAsync();
+    expect(mockConnection.send).toHaveBeenCalledTimes(1);
+    expect(statusHandler).toHaveBeenCalledTimes(1);
+
+    // Run the second interval
+    await jest.runOnlyPendingTimersAsync();
+    expect(mockConnection.send).toHaveBeenCalledTimes(2);
+    expect(statusHandler).toHaveBeenCalledTimes(2);
+
+    controller.stopStatusPolling();
+
+    // This should do nothing now
+    await jest.runOnlyPendingTimersAsync();
+    expect(mockConnection.send).toHaveBeenCalledTimes(2);
+    expect(statusHandler).toHaveBeenCalledTimes(2);
+  });
+
+  it('should perform homing', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+    await controller.home();
+    expect(mockConnection.send).toHaveBeenCalledWith('$H\n');
+
+    await controller.home('XY');
+    expect(mockConnection.send).toHaveBeenCalledWith('$HXY\n');
+  });
+
+  it('should perform jogging', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+    await controller.jog({ x: 10, y: -5 }, 1000);
+    expect(mockConnection.send).toHaveBeenCalledWith('$J=G91 X10 Y-5 F1000\n');
+  });
+
+  it('should stream G-code from a string', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+    const gcode = 'G0 X10\nG1 Y20 F500';
+
+    const progressHandler = jest.fn();
+    controller.on('jobProgress', progressHandler);
+
+    await controller.streamGCode(gcode);
+
+    expect(mockConnection.send).toHaveBeenCalledWith('G0 X10\n');
+    expect(mockConnection.send).toHaveBeenCalledWith('G1 Y20 F500\n');
+    expect(progressHandler).toHaveBeenCalledTimes(2);
+  });
+
+  it('should stream G-code from a file', async () => {
+    const gcode = 'G0 Z10\nG1 X0 Y0 F1000';
+    (fs.readFile as jest.Mock).mockResolvedValue(gcode);
+
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+    await controller.streamGCode('/path/to/file.gcode', true);
+
+    expect(fs.readFile).toHaveBeenCalledWith('/path/to/file.gcode', 'utf8');
+    expect(mockConnection.send).toHaveBeenCalledWith('G0 Z10\n');
+    expect(mockConnection.send).toHaveBeenCalledWith('G1 X0 Y0 F1000\n');
+  });
+
+  it('should perform a probe', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
     
-    const sendCommandSpy = jest.spyOn(controller as any, 'sendCommand');
-    sendCommandSpy.mockResolvedValue('некорректный ответ');
-    
-    await expect(controller.getStatus()).rejects.toThrow('Невозможно распарсить статус');
-    
-    sendCommandSpy.mockRestore();
+    mockConnection.send.mockImplementation(async (data: string) => {
+      if (data.startsWith('G38.2')) {
+        setTimeout(() => mockConnection.emit('data', '[PRB:10,20,5.5:1]ok'), 10);
+      }
+    });
+
+    const result = await controller.probe('Z', 50);
+    expect(result).toEqual({ x: 10, y: 20, z: 5.5 });
+    expect(mockConnection.send).toHaveBeenCalledWith('G38.2 Z-100 F50\n');
+  });
+
+  it('should stop a job', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+    await controller.stopJob();
+    expect(mockConnection.send).toHaveBeenCalledWith('!');
+  });
+
+  it('should perform a grid probe', async () => {
+    await controller.connect({ type: ConnectionType.Serial, port: '/dev/test' });
+  
+    // Mock getStatus to provide a starting position
+    jest.spyOn(controller, 'getStatus').mockResolvedValue({
+      state: 'Idle',
+      position: { x: 0, y: 0, z: 0 },
+      feed: 100,
+    });
+
+    // Mock the probe method
+    let probeCounter = 0;
+    jest.spyOn(controller, 'probe').mockImplementation(async () => {
+      probeCounter++;
+      return { x: 1, y: 2, z: 3 + probeCounter };
+    });
+
+    const gridSize = { x: 10, y: 10 };
+    const step = 10;
+    const feed = 50;
+
+    const results = await controller.probeGrid(gridSize, step, feed);
+
+    // 2x2 grid = 4 probe points
+    expect(results.length).toBe(4);
+    expect(controller.getStatus).toHaveBeenCalled();
+    expect(controller.probe).toHaveBeenCalledTimes(4);
+
+    // Verify movement commands
+    expect(mockConnection.send).toHaveBeenCalledWith('G0 X0 Y0\n');
+    expect(mockConnection.send).toHaveBeenCalledWith('G0 X10 Y0\n');
+    expect(mockConnection.send).toHaveBeenCalledWith('G0 X0 Y10\n');
+    expect(mockConnection.send).toHaveBeenCalledWith('G0 X10 Y10\n');
+
+    // Verify retraction commands
+    expect(mockConnection.send).toHaveBeenCalledWith('G91 G0 Z5\n');
+    expect(mockConnection.send).toHaveBeenCalledWith('G90\n');
+    expect(mockConnection.send.mock.calls.filter(c => c[0] === 'G91 G0 Z5\n').length).toBe(4);
   });
 });
