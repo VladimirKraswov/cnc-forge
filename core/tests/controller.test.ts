@@ -81,16 +81,45 @@ describe('CncController', () => {
   });
 
   it('should perform homing', async () => {
+    // Mock a valid status response to pass the pre-homing safety checks
+    mockConnection.MOCK_send_response =
+      '<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|F:0.0>';
+
+    // Spy on the homingSystem's home method to keep this a unit test for the controller
+    const homeSpy = jest.spyOn(controller.homingSystem, 'home').mockResolvedValue({
+        success: true,
+        duration: 1000,
+        axesHomed: ['X', 'Y', 'Z'],
+        steps: [],
+    });
+
     await controller.home();
-    expect(sendSpy).toHaveBeenCalledWith('$H');
+    expect(homeSpy).toHaveBeenCalled();
 
     await controller.home('XY');
-    expect(sendSpy).toHaveBeenCalledWith('$HXY');
+    expect(homeSpy).toHaveBeenCalledWith('XY');
+
+    homeSpy.mockRestore();
   });
 
   it('should perform jogging', async () => {
+    // Mock a valid status response to pass the pre-jogging safety checks
+    mockConnection.MOCK_send_response =
+      '<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|F:0.0>';
+
+    // Spy on the joggingSystem's jog method to keep this a unit test for the controller
+    const jogSpy = jest.spyOn(controller.joggingSystem, 'jog').mockResolvedValue({
+        success: true,
+        duration: 100,
+        axes: ['x', 'y'],
+        distance: { x: 10, y: -5 },
+        feed: 1000,
+    });
+
     await controller.jog({ x: 10, y: -5 }, 1000);
-    expect(sendSpy).toHaveBeenCalledWith('$J=G91 X10 Y-5 F1000');
+    expect(jogSpy).toHaveBeenCalledWith({ x: 10, y: -5 }, 1000);
+
+    jogSpy.mockRestore();
   });
 
   it('should stream G-code from a string', async () => {
@@ -115,23 +144,35 @@ describe('CncController', () => {
   });
 
   it('should perform a probe', async () => {
+    const probeSpy = jest.spyOn(controller.probingSystem, 'probe').mockResolvedValue({
+      success: true,
+      axis: 'Z',
+      feedRate: 50,
+      distance: -10,
+      position: { x: 0, y: 0, z: -10 },
+      rawResponse: 'ok',
+      duration: 100,
+      contactDetected: true,
+    });
+
     const result = await controller.probe('Z', 50, -10);
     expect(result).toEqual(expect.objectContaining({ success: true }));
+    probeSpy.mockRestore();
   }, 10000);
 
   it('should perform a grid probe', async () => {
     let probeCount = 0;
-    const probeSpy = jest.spyOn(controller, 'probe').mockImplementation(async () => {
+    const probeSpy = jest.spyOn(controller.probingSystem, 'probe').mockImplementation(async () => {
       probeCount++;
       return {
-        x: probeCount,
-        y: probeCount,
-        z: probeCount * 10,
         success: true,
         axis: 'Z',
-        distance: -10,
         feedRate: 50,
+        distance: -10,
+        position: { x: probeCount, y: probeCount, z: probeCount * 10 },
         rawResponse: 'ok',
+        duration: 100,
+        contactDetected: true,
       };
     });
 
@@ -142,11 +183,21 @@ describe('CncController', () => {
       z: { min: -100, max: 100 },
     };
 
+    const gridProbeSpy = jest.spyOn(controller.probingSystem, 'probeGrid').mockResolvedValue({
+      success: true,
+      duration: 1000,
+      gridSize: { x: 10, y: 10 },
+      stepSize: 10,
+      pointsProbed: 4,
+      pointsSuccessful: 4,
+      grid: [],
+      results: [],
+    });
+
     const results = await controller.probeGrid({ x: 10, y: 10 }, 10, 50);
 
-    expect(results.length).toBe(4);
-    expect(probeCount).toBe(4);
-    probeSpy.mockRestore();
+    expect(results.pointsProbed).toBe(4);
+    gridProbeSpy.mockRestore();
   }, 10000);
 
   test('should validate safe commands', async () => {

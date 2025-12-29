@@ -7,29 +7,16 @@ import { ConnectionFactory } from '../connections';
 import { CommandManager } from '../command/CommandManager';
 import { SafetySystem } from '../safety/SafetySystem';
 import { RecoverySystem, RecoveryDiagnosis, RecoveryState } from '../recovery/RecoverySystem';
-
-// Определяем расширенные интерфейсы для зондирования
-interface IProbeResultExtended extends IPosition {
-  success: boolean;
-  axis: string;
-  distance: number;
-  feedRate: number;
-  rawResponse: string;
-  error?: string;
-}
-
-interface IGridProbeResult extends IProbeResultExtended {
-  gridPosition?: {
-    x: number;
-    y: number;
-  };
-}
+import { HomingSystem, JoggingSystem, ProbingSystem, HomingResult, JogResult, ProbeResult, GridProbeResult } from '../operations';
 
 export class CncController extends EventEmitter implements ICncControllerCore, ICncEventEmitter {
   private connection: IConnection | null = null;
   private commandManager: CommandManager;
   private safetySystem: SafetySystem;
   private recoverySystem: RecoverySystem;
+  public homingSystem: HomingSystem;
+  public joggingSystem: JoggingSystem;
+  public probingSystem: ProbingSystem;
   private lastKnownPosition: IPosition = { x: 0, y: 0, z: 0 };
   private expectedPosition: IPosition = { x: 0, y: 0, z: 0 };
   private positioningMode: 'G90' | 'G91' = 'G90'; // Default to absolute
@@ -56,6 +43,9 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     this.commandManager = new CommandManager();
     this.safetySystem = new SafetySystem();
     this.recoverySystem = new RecoverySystem();
+    this.homingSystem = new HomingSystem(this, this.safetySystem);
+    this.joggingSystem = new JoggingSystem(this, this.safetySystem);
+    this.probingSystem = new ProbingSystem(this, this.safetySystem);
 
     // Периодическая самодиагностика
     setInterval(() => {
@@ -243,26 +233,15 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     }
   }
 
-  async home(axes: string = ''): Promise<string> {
-    if (axes) {
-      return this.sendCommand(`$H${axes.toUpperCase()}`);
-    }
-    return this.sendCommand('$H');
+  async home(axes?: string): Promise<HomingResult> {
+    return this.homingSystem.home(axes);
   }
 
   async jog(
     axes: { x?: number; y?: number; z?: number },
     feed: number
-  ): Promise<string> {
-    const axisCommands = Object.entries(axes)
-      .map(([axis, distance]) => `${axis.toUpperCase()}${distance}`)
-      .join(' ');
-
-    if (!axisCommands) {
-      throw new Error('No axes specified for jogging.');
-    }
-
-    return this.sendCommand(`$J=G91 ${axisCommands} F${feed}`);
+  ): Promise<JogResult> {
+    return this.joggingSystem.jog(axes, feed);
   }
 
   async streamGCode(
@@ -357,76 +336,20 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     return result;
   }
 
-  async probe(axis: string, feedRate: number, distance: number): Promise<IProbeResultExtended> {
-    const command = `G38.2 ${axis.toUpperCase()}${distance} F${feedRate}`;
-    const response = await this.sendCommand(command);
-
-    if (response.includes('[PRB')) {
-      const match = response.match(/\[PRB:([\d.-]+),([\d.-]+),([\d.-]+):(\d)\]/);
-      if (match) {
-        return {
-          x: parseFloat(match[1]),
-          y: parseFloat(match[2]),
-          z: parseFloat(match[3]),
-          success: parseInt(match[4]) === 1,
-          axis: axis.toUpperCase(),
-          distance,
-          feedRate,
-          rawResponse: response,
-        };
-      }
-    }
-    throw new Error('Failed to parse probe response');
+  async probe(
+    axis: 'X' | 'Y' | 'Z',
+    feedRate: number,
+    distance: number
+  ): Promise<ProbeResult> {
+    return this.probingSystem.probe(axis, feedRate, distance);
   }
 
   async probeGrid(
     gridSize: { x: number; y: number },
     stepSize: number,
     feedRate: number
-  ): Promise<IGridProbeResult[]> {
-    if (!this.connection || !this.isConnected()) {
-      throw new Error('Not connected');
-    }
-
-    const results: IGridProbeResult[] = [];
-    const startX = -gridSize.x / 2;
-    const startY = -gridSize.y / 2;
-    const safeZ = this.safetySystem.getSafeTravelHeight();
-
-    await this.sendCommand(`G0 Z${safeZ}`);
-    await this.sendCommand(`G0 X${startX} Y${startY}`);
-
-    for (let y = 0; y <= gridSize.y; y += stepSize) {
-      for (let x = 0; x <= gridSize.x; x += stepSize) {
-        const targetX = startX + x;
-        const targetY = startY + y;
-        await this.sendCommand(`G0 X${targetX} Y${targetY}`);
-
-        try {
-          const probeResult = await this.probe('Z', feedRate, -100);
-          results.push({ ...probeResult, gridPosition: { x: targetX, y: targetY } });
-          await this.sendCommand('G0 Z10');
-        } catch (error) {
-          results.push({
-            x: 0,
-            y: 0,
-            z: 0,
-            success: false,
-            axis: 'Z',
-            distance: -100,
-            feedRate,
-            rawResponse: (error as Error).message,
-            error: 'Probe failed',
-            gridPosition: { x: targetX, y: targetY },
-          });
-          await this.sendCommand('G0 Z10');
-        }
-        await new Promise(resolve => setTimeout(resolve, 50));
-      }
-    }
-
-    await this.sendCommand('G0 X0 Y0 Z10');
-    return results;
+  ): Promise<GridProbeResult> {
+    return this.probingSystem.probeGrid(gridSize, stepSize, feedRate);
   }
 
   getCurrentPosition(): IPosition {
