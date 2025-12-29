@@ -6,6 +6,7 @@ import fs from 'fs/promises';
 import { ConnectionFactory } from '../connections';
 import { CommandManager } from '../command/CommandManager';
 import { SafetySystem } from '../safety/SafetySystem';
+import { RecoverySystem, RecoveryDiagnosis, RecoveryState } from '../recovery/RecoverySystem';
 
 // Определяем расширенные интерфейсы для зондирования
 interface IProbeResultExtended extends IPosition {
@@ -28,15 +29,38 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   private connection: IConnection | null = null;
   private commandManager: CommandManager;
   private safetySystem: SafetySystem;
-  private currentPosition: IPosition = { x: 0, y: 0, z: 0 };
+  private recoverySystem: RecoverySystem;
+  private lastKnownPosition: IPosition = { x: 0, y: 0, z: 0 };
+  private expectedPosition: IPosition = { x: 0, y: 0, z: 0 };
+  private positioningMode: 'G90' | 'G91' = 'G90'; // Default to absolute
+  private commandJournal: Array<{
+    command: string;
+    timestamp: Date;
+    expectedPositionChange?: Partial<IPosition>;
+  }> = [];
   private isHomed: boolean = false;
   private connected: boolean = false;
   private statusPollingIntervalId: NodeJS.Timeout | null = null;
+  private lastAlarmCode: number | null = null;
+
+  public getLastAlarmCode(): number | null {
+    return this.lastAlarmCode;
+  }
+
+  public getExpectedPosition(): IPosition {
+    return this.expectedPosition;
+  }
 
   constructor() {
     super();
     this.commandManager = new CommandManager();
     this.safetySystem = new SafetySystem();
+    this.recoverySystem = new RecoverySystem();
+
+    // Периодическая самодиагностика
+    setInterval(() => {
+      this.autoDiagnose().catch(console.error);
+    }, 30000); // Каждые 30 секунд
   }
 
   async connect(options: IConnectionOptions): Promise<void> {
@@ -95,7 +119,49 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
       this.emit('warning', safetyCheck.warning);
     }
 
-    return this.commandManager.execute(command, this.connection, timeout);
+    const upperCommand = command.toUpperCase();
+    if (upperCommand.includes('G90')) this.positioningMode = 'G90';
+    if (upperCommand.includes('G91')) this.positioningMode = 'G91';
+
+    const result = await this.commandManager.execute(command, this.connection, timeout);
+
+    // Логируем команду и ожидаемое изменение позиции
+    const expectedChange = this.calculateExpectedPositionChange(command);
+    this.commandJournal.push({
+      command,
+      timestamp: new Date(),
+      expectedPositionChange: expectedChange
+    });
+
+    // Обновляем ожидаемую позицию
+    if (expectedChange) {
+      if (upperCommand.startsWith('$J=')) { // Jog commands are always relative
+        this.expectedPosition = {
+          x: this.expectedPosition.x + (expectedChange.x || 0),
+          y: this.expectedPosition.y + (expectedChange.y || 0),
+          z: this.expectedPosition.z + (expectedChange.z || 0)
+        };
+      } else if (this.positioningMode === 'G90') { // Absolute
+        this.expectedPosition = {
+          x: expectedChange.x ?? this.expectedPosition.x,
+          y: expectedChange.y ?? this.expectedPosition.y,
+          z: expectedChange.z ?? this.expectedPosition.z
+        };
+      } else { // Relative
+        this.expectedPosition = {
+          x: this.expectedPosition.x + (expectedChange.x || 0),
+          y: this.expectedPosition.y + (expectedChange.y || 0),
+          z: this.expectedPosition.z + (expectedChange.z || 0)
+        };
+      }
+    }
+
+    // Сохраняем только последние 1000 команд
+    if (this.commandJournal.length > 1000) {
+      this.commandJournal.shift();
+    }
+
+    return result;
   }
 
   private handleIncomingData(data: string): void {
@@ -105,6 +171,7 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     if (trimmedData.startsWith('<')) {
       try {
         const status = this.parseGrblStatus(trimmedData);
+        this.updatePosition(status.position);
         this.emit('status', status);
       } catch (error) {
         // Ignore parsing errors
@@ -113,6 +180,7 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
 
     if (trimmedData.startsWith('ALARM:')) {
       const alarmCode = parseInt(trimmedData.split(':')[1], 10);
+      this.lastAlarmCode = alarmCode;
       const alarmMessage = this.getAlarmMessage(alarmCode);
       const alarm: IAlarm = { code: alarmCode, message: alarmMessage };
       this.emit('alarm', alarm);
@@ -362,7 +430,7 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   }
 
   getCurrentPosition(): IPosition {
-    return { ...this.currentPosition };
+    return { ...this.lastKnownPosition };
   }
 
   getSafetyStatus(): {
@@ -375,5 +443,127 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
       isHomed: this.isHomed,
       isSafe: this.safetySystem.isSafeToMove(),
     };
+  }
+
+  // Автоматическая диагностика
+  async autoDiagnose(): Promise<void> {
+    try {
+      const diagnosis = await this.recoverySystem.diagnose(this);
+
+      if (diagnosis.state !== RecoveryState.Normal) {
+        this.emit('recoveryNeeded', diagnosis);
+
+        // Для критических состояний - автоматическое восстановление
+        if (diagnosis.severity === 'critical') {
+          console.warn('Критическое состояние, запускаем автоматическое восстановление');
+          await this.autoRecover(diagnosis);
+        }
+      }
+    } catch (error) {
+      console.error('Ошибка при автоматической диагностике:', error);
+    }
+  }
+
+  // Автоматическое восстановление
+  async autoRecover(diagnosis: RecoveryDiagnosis): Promise<void> {
+    this.emit('recoveryStarted', diagnosis);
+
+    try {
+      await this.recoverySystem.executeRecovery(diagnosis, this);
+      this.emit('recoveryCompleted', diagnosis);
+    } catch (error) {
+      this.emit('recoveryFailed', { diagnosis, error: error as Error });
+      throw error;
+    }
+  }
+
+  // Ручное восстановление
+  async manualRecovery(): Promise<void> {
+    const diagnosis = await this.recoverySystem.diagnose(this);
+
+    if (diagnosis.state === RecoveryState.Normal) {
+      console.log('Станок в нормальном состоянии, восстановление не требуется');
+      return;
+    }
+
+    console.log('=== РУКОВОДСТВО ПО ВОССТАНОВЛЕНИЮ ===');
+    console.log(`Проблема: ${diagnosis.probableCause}`);
+    console.log('Серьезность:', diagnosis.severity);
+    console.log('Затронутые оси:', diagnosis.affectedAxes.join(', '));
+    console.log('\nРекомендуемые действия:');
+    diagnosis.recommendedActions.forEach((action, i) => {
+      console.log(`${i + 1}. ${action}`);
+    });
+
+    // Здесь в реальном приложении был бы UI
+    console.log('\nДля автоматического восстановления вызовите controller.autoRecover()');
+    console.log('Или выполните шаги вручную согласно инструкции выше');
+  }
+
+  // Получение информации для отладки
+  getRecoveryInfo(): {
+    currentState: RecoveryState;
+    lastDiagnosis?: RecoveryDiagnosis;
+    commandJournalSize: number;
+    positionMismatch: boolean;
+  } {
+    const lastDiagnosis = this.recoverySystem.getDiagnosisHistory()[0];
+    const positionMismatch = this.checkPositionMismatch();
+
+    return {
+      currentState: this.recoverySystem.getCurrentState(),
+      lastDiagnosis,
+      commandJournalSize: this.commandJournal.length,
+      positionMismatch
+    };
+  }
+
+  private calculateExpectedPositionChange(command: string): Partial<IPosition> | undefined {
+    const upper = command.toUpperCase();
+
+    if (upper.startsWith('G0') || upper.startsWith('G1') || upper.startsWith('G2') || upper.startsWith('G3')) {
+      const xMatch = upper.match(/X([\d.-]+)/);
+      const yMatch = upper.match(/Y([\d.-]+)/);
+      const zMatch = upper.match(/Z([\d.-]+)/);
+
+      const positionChange: Partial<IPosition> = {};
+      if (xMatch) positionChange.x = parseFloat(xMatch[1]);
+      if (yMatch) positionChange.y = parseFloat(yMatch[1]);
+      if (zMatch) positionChange.z = parseFloat(zMatch[1]);
+
+      return Object.keys(positionChange).length > 0 ? positionChange : undefined;
+    }
+
+    if (upper.startsWith('$J=')) {
+        const xMatch = upper.match(/X([\d.-]+)/);
+        const yMatch = upper.match(/Y([\d.-]+)/);
+        const zMatch = upper.match(/Z([\d.-]+)/);
+
+        const positionChange: Partial<IPosition> = {};
+        if (xMatch) positionChange.x = parseFloat(xMatch[1]);
+        if (yMatch) positionChange.y = parseFloat(yMatch[1]);
+        if (zMatch) positionChange.z = parseFloat(zMatch[1]);
+
+        return positionChange;
+    }
+
+    return undefined;
+  }
+
+  public checkPositionMismatch(): boolean {
+    // Сравниваем ожидаемую позицию с последней известной
+    // В реальности нужно получать актуальную позицию со станка
+
+    const tolerance = 0.1; // 0.1 мм
+    const diffX = Math.abs(this.expectedPosition.x - this.lastKnownPosition.x);
+    const diffY = Math.abs(this.expectedPosition.y - this.lastKnownPosition.y);
+    const diffZ = Math.abs(this.expectedPosition.z - this.lastKnownPosition.z);
+
+    return diffX > tolerance || diffY > tolerance || diffZ > tolerance;
+  }
+
+  // Обновление последней известной позиции
+  updatePosition(position: IPosition): void {
+    this.lastKnownPosition = { ...position };
   }
 }
