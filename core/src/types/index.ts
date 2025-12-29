@@ -29,3 +29,5 @@ export interface ValidationResult {
   error?: string;
   warning?: string;
 }
+
+export type ConnectionQuality = 'excellent' | 'good' | 'poor' | 'unknown';

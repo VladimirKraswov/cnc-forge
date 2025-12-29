@@ -10,5 +10,8 @@
   "workspaces": [
     "core",
     "gui"
-  ]
+  ],
+  "dependencies": {
+    "@serialport/parser-readline": "^13.0.0"
+  }
 }

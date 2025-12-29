@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { IGrblStatus, IAlarm, IPosition } from '../types';
 import { IConnection, IConnectionOptions } from '../interfaces/Connection';
+import { ICncControllerCore, ICncEventEmitter } from '../interfaces/CncController';
 import fs from 'fs/promises';
 import { ConnectionFactory } from '../connections';
 
@@ -21,7 +22,7 @@ interface IGridProbeResult extends IProbeResultExtended {
   };
 }
 
-export class CncController extends EventEmitter {
+export class CncController extends EventEmitter implements ICncControllerCore, ICncEventEmitter {
   private connection: IConnection | null = null;
   private connected: boolean = false;
   private responseBuffer: string = '';
@@ -29,7 +30,7 @@ export class CncController extends EventEmitter {
     resolve: (value: string) => void;
     reject: (error: Error) => void;
   } | null = null;
-  private statusPollingIntervalId: any | null = null;
+  private statusPollingIntervalId: NodeJS.Timeout | null = null;
 
   async connect(options: IConnectionOptions): Promise<void> {
     try {
@@ -157,13 +158,13 @@ export class CncController extends EventEmitter {
 
   private parseGrblStatus(response: string): IGrblStatus {
     const match = response.match(
-      /<(\w+)\|MPos:([\d.-]+),([\d.-]+),([\d.-]+)\|(?:WPos:[\d.-]+,[\d.-]+,[\d.-]+)?\|?(?:F:([\d.-]+))?/
+      /<(\w+)\|MPos:([\d.-]+),([\d.-]+),([\d.-]+)\|WPos:([\d.-]+),([\d.-]+),([\d.-]+)\|F:([\d.-]+)>/
     );
     if (match) {
       return {
         state: match[1] as IGrblStatus['state'],
         position: { x: parseFloat(match[2]), y: parseFloat(match[3]), z: parseFloat(match[4]) },
-        feed: match[5] ? parseFloat(match[5]) : undefined,
+        feed: parseFloat(match[8]),
       };
     }
     throw new Error(`Cannot parse status: ${response}`);
@@ -256,6 +257,14 @@ export class CncController extends EventEmitter {
     this.emit('jobComplete');
   }
 
+  async emergencyStop(): Promise<void> {
+    await this.sendCommand('\x18');
+  }
+
+  async feedHold(): Promise<void> {
+    await this.sendCommand('!');
+  }
+
   async stopJob(): Promise<string> {
     if (!this.connection || !this.isConnected()) {
       throw new Error('Not connected');
@@ -293,40 +302,30 @@ export class CncController extends EventEmitter {
     // Send probe command to GRBL
     // Format: G38.2 Z-100 F100 for Z-axis probing
     const command = `G38.2 ${axis.toUpperCase()}${distance} F${feedRate}`;
-    try {
-      const response = await this.sendCommand(command);
-      
-      // Get final position after probing
-      await new Promise(resolve => setTimeout(resolve, 100)); // Small delay
-      const status = await this.getStatus();
-      
-      return {
-        x: status.position.x,
-        y: status.position.y,
-        z: status.position.z,
-        success: response.includes('ok') && !response.includes('error'),
-        axis: axis.toUpperCase(),
-        distance: distance,
-        feedRate: feedRate,
-        rawResponse: response
+    return new Promise<IProbeResultExtended>((resolve, reject) => {
+      const handler = (data: string) => {
+        if (data.includes('[PRB')) {
+          this.connection!.removeListener('data', handler);
+          const match = data.match(/\[PRB:([\d.-]+),([\d.-]+),([\d.-]+):(\d)\]/);
+          if (match) {
+            resolve({
+              x: parseFloat(match[1]),
+              y: parseFloat(match[2]),
+              z: parseFloat(match[3]),
+              success: parseInt(match[4]) === 1,
+              axis: axis.toUpperCase(),
+              distance,
+              feedRate,
+              rawResponse: data
+            });
+          } else {
+            reject(new Error('Failed to parse probe response'));
+          }
+        }
       };
-    } catch (error) {
-      const errorMsg = (error as Error).message;
-      if (errorMsg.includes('Probe fail') || errorMsg.includes('ALARM:4') || errorMsg.includes('ALARM:5')) {
-        return {
-          x: 0,
-          y: 0,
-          z: 0,
-          success: false,
-          axis: axis.toUpperCase(),
-          distance: distance,
-          feedRate: feedRate,
-          rawResponse: errorMsg,
-          error: 'Probe failed to contact workpiece'
-        };
-      }
-      throw error;
-    }
+      this.connection!.on('data', handler);
+      this.sendCommand(command).catch(reject);
+    });
   }
 
   async probeGrid(

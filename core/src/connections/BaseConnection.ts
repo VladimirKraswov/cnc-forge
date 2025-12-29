@@ -1,66 +1,111 @@
 import { EventEmitter } from 'events';
-import { IConnection, ConnectionConfig } from '../types';
+import { IConnection, IConnectionOptions } from '../interfaces/Connection';
+import { ConnectionQuality } from '../types';
 
-export abstract class BaseConnection<T extends ConnectionConfig = ConnectionConfig>
-  extends EventEmitter
-  implements IConnection
-{
-  protected _isConnected: boolean = false;
-  protected config: T;
+export abstract class BaseConnection extends EventEmitter implements IConnection {
+  protected options: IConnectionOptions;
+  protected connected: boolean = false;
+  protected connectionQuality: ConnectionQuality = 'unknown';
+  protected lastHeartbeat: Date | null = null;
+  protected reconnectAttempts: number = 0;
+  protected maxReconnectAttempts: number = 5;
+  protected commandBuffer: Array<{ cmd: string; timestamp: Date }> = [];
+  private monitoringInterval: NodeJS.Timeout | null = null;
 
-  constructor(config: T) {
+  constructor(options: IConnectionOptions) {
     super();
-    this.config = config;
+    this.options = options;
   }
 
   abstract connect(): Promise<void>;
   abstract disconnect(): Promise<void>;
   abstract send(data: string): Promise<void>;
 
-  get isConnected(): boolean {
-    return this._isConnected;
+  protected startConnectionMonitoring(): void {
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+    }
+    this.monitoringInterval = setInterval(() => {
+      this.updateConnectionQuality();
+      this.checkHeartbeat();
+    }, 1000);
   }
 
-  protected emitConnected(): void {
-    this._isConnected = true;
-    this.emit('connected');
+  protected stopConnectionMonitoring(): void {
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+      this.monitoringInterval = null;
+    }
   }
 
-  protected emitDisconnected(): void {
-    this._isConnected = false;
+  protected updateConnectionQuality(): void {
+    // Logic for evaluating connection quality
+    // Based on: timeouts, errors, delays
+  }
+
+  protected checkHeartbeat(): void {
+    if (!this.lastHeartbeat) return;
+    const diff = Date.now() - this.lastHeartbeat.getTime();
+    if (diff > 5000) {
+      // 5 seconds without data
+      this.emit('error', new Error('Heartbeat timeout'));
+      this.scheduleReconnect();
+    }
+  }
+
+  protected onDisconnect(): void {
+    this.connected = false;
+    this.stopConnectionMonitoring();
     this.emit('disconnected');
+    this.scheduleReconnect();
   }
 
-  protected emitData(data: string): void {
-    this.emit('data', data);
+  protected scheduleReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.emit('error', new Error('Max reconnection attempts reached'));
+      return;
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    this.reconnectAttempts++;
+
+    setTimeout(() => {
+      this.reconnect();
+    }, delay);
   }
 
-  protected emitError(error: Error): void {
-    this.emit('error', error);
+  protected async reconnect(): Promise<void> {
+    try {
+      await this.disconnect();
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      await this.connect();
+      this.reconnectAttempts = 0;
+    } catch (error) {
+      this.scheduleReconnect();
+    }
   }
 
-  // Типизация методов EventEmitter
-  public on(event: 'connected', listener: () => void): this;
-  public on(event: 'disconnected', listener: () => void): this;
-  public on(event: 'data', listener: (data: string) => void): this;
-  public on(event: 'error', listener: (error: Error) => void): this;
-  public on(event: string | symbol, listener: (...args: any[]) => void): this {
-    return super.on(event, listener);
+  protected logCommand(cmd: string): void {
+    this.commandBuffer.push({
+      cmd,
+      timestamp: new Date(),
+    });
+
+    // Store only the last 100 commands
+    if (this.commandBuffer.length > 100) {
+      this.commandBuffer.shift();
+    }
   }
 
-  public once(event: 'connected', listener: () => void): this;
-  public once(event: 'disconnected', listener: () => void): this;
-  public once(event: 'data', listener: (data: string) => void): this;
-  public once(event: 'error', listener: (error: Error) => void): this;
-  public once(event: string | symbol, listener: (...args: any[]) => void): this {
-    return super.once(event, listener);
+  get isConnected(): boolean {
+    return this.connected && this.connectionQuality !== 'poor';
   }
 
-  public off(event: string | symbol, listener: (...args: any[]) => void): this {
-    return super.off(event, listener);
+  getConnectionQuality(): ConnectionQuality {
+    return this.connectionQuality;
   }
 
-  public removeAllListeners(event?: string | symbol): this {
-    return super.removeAllListeners(event);
+  getCommandHistory(): Array<{ cmd: string; timestamp: Date }> {
+    return [...this.commandBuffer];
   }
 }
