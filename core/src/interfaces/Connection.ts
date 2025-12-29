@@ -26,4 +26,5 @@ export interface IConnection {
   on(event: 'disconnected', listener: () => void): this;
   on(event: 'data', listener: (data: string) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
+  removeListener(event: string, listener: (...args: any[]) => void): this;
 }
