@@ -4,6 +4,8 @@ import { IConnection, IConnectionOptions } from '../interfaces/Connection';
 import { ICncControllerCore, ICncEventEmitter } from '../interfaces/CncController';
 import fs from 'fs/promises';
 import { ConnectionFactory } from '../connections';
+import { CommandManager } from '../command/CommandManager';
+import { SafetySystem } from '../safety/SafetySystem';
 
 // Определяем расширенные интерфейсы для зондирования
 interface IProbeResultExtended extends IPosition {
@@ -24,13 +26,18 @@ interface IGridProbeResult extends IProbeResultExtended {
 
 export class CncController extends EventEmitter implements ICncControllerCore, ICncEventEmitter {
   private connection: IConnection | null = null;
+  private commandManager: CommandManager;
+  private safetySystem: SafetySystem;
+  private currentPosition: IPosition = { x: 0, y: 0, z: 0 };
+  private isHomed: boolean = false;
   private connected: boolean = false;
-  private responseBuffer: string = '';
-  private responsePromise: {
-    resolve: (value: string) => void;
-    reject: (error: Error) => void;
-  } | null = null;
   private statusPollingIntervalId: NodeJS.Timeout | null = null;
+
+  constructor() {
+    super();
+    this.commandManager = new CommandManager();
+    this.safetySystem = new SafetySystem();
+  }
 
   async connect(options: IConnectionOptions): Promise<void> {
     try {
@@ -74,55 +81,26 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     return this.connected && (this.connection?.isConnected || false);
   }
 
-  async sendCommand(command: string, timeout: number = 5000): Promise<string> {
-    if (!this.connection || !this.isConnected()) {
-      throw new Error('Not connected');
+  async sendCommand(command: string, timeout?: number): Promise<string> {
+    if (!this.connection || !this.connection.isConnected) {
+      throw new Error('Not connected to machine');
     }
 
-    this.responseBuffer = '';
+    const safetyCheck = this.safetySystem.validateCommand(command);
+    if (!safetyCheck.isValid) {
+      throw new Error(`Safety violation: ${safetyCheck.error}`);
+    }
 
-    return new Promise<string>((resolve, reject) => {
-      let timeoutId: NodeJS.Timeout;
-      const wrappedResolve = (value: string) => {
-        clearTimeout(timeoutId);
-        resolve(value);
-      };
+    if (safetyCheck.warning) {
+      this.emit('warning', safetyCheck.warning);
+    }
 
-      this.responsePromise = { resolve: wrappedResolve, reject };
-
-      this.connection!.send(command + '\n').catch((error: Error) => {
-        if (this.responsePromise) {
-          this.responsePromise.reject(error);
-          this.responsePromise = null;
-        }
-      });
-
-      timeoutId = setTimeout(() => {
-        if (this.responsePromise) {
-          this.responsePromise.reject(new Error('Response timeout'));
-          this.responsePromise = null;
-        }
-      }, timeout);
-    });
+    return this.commandManager.execute(command, this.connection, timeout);
   }
 
   private handleIncomingData(data: string): void {
     const trimmedData = data.trim();
-
-    this.responseBuffer += trimmedData;
     this.emit('statusUpdate', trimmedData);
-
-    if (
-      this.responsePromise &&
-      (this.responseBuffer.includes('ok') ||
-        this.responseBuffer.includes('error') ||
-        this.responseBuffer.includes('alarm'))
-    ) {
-      const response = this.responseBuffer.trim();
-      this.responsePromise.resolve(response);
-      this.responsePromise = null;
-      this.responseBuffer = '';
-    }
 
     if (trimmedData.startsWith('<')) {
       try {
@@ -258,11 +236,22 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   }
 
   async emergencyStop(): Promise<void> {
-    await this.sendCommand('\x18');
+    try {
+      await this.connection?.send('\x18'); // Ctrl-X for soft-reset
+    } catch (error) {
+      // Ignore errors during emergency stop
+    }
+    this.commandManager.clear();
+    this.emit('emergencyStop');
   }
 
   async feedHold(): Promise<void> {
-    await this.sendCommand('!');
+    try {
+      await this.connection?.send('!');
+      this.emit('feedHold');
+    } catch (error) {
+      this.emit('error', error as Error);
+    }
   }
 
   async stopJob(): Promise<string> {
@@ -274,7 +263,13 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   }
 
   async softReset(): Promise<void> {
-    await this.sendCommand('\x18');
+    try {
+      await this.connection?.send('\x18'); // Ctrl-X
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      this.emit('softReset');
+    } catch (error) {
+      this.emit('error', error as Error);
+    }
   }
 
   async getSettings(): Promise<string[]> {
@@ -295,37 +290,25 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   }
 
   async probe(axis: string, feedRate: number, distance: number): Promise<IProbeResultExtended> {
-    if (!this.connection || !this.isConnected()) {
-      throw new Error('Not connected');
-    }
-
-    // Send probe command to GRBL
-    // Format: G38.2 Z-100 F100 for Z-axis probing
     const command = `G38.2 ${axis.toUpperCase()}${distance} F${feedRate}`;
-    return new Promise<IProbeResultExtended>((resolve, reject) => {
-      const handler = (data: string) => {
-        if (data.includes('[PRB')) {
-          this.connection!.removeListener('data', handler);
-          const match = data.match(/\[PRB:([\d.-]+),([\d.-]+),([\d.-]+):(\d)\]/);
-          if (match) {
-            resolve({
-              x: parseFloat(match[1]),
-              y: parseFloat(match[2]),
-              z: parseFloat(match[3]),
-              success: parseInt(match[4]) === 1,
-              axis: axis.toUpperCase(),
-              distance,
-              feedRate,
-              rawResponse: data
-            });
-          } else {
-            reject(new Error('Failed to parse probe response'));
-          }
-        }
-      };
-      this.connection!.on('data', handler);
-      this.sendCommand(command).catch(reject);
-    });
+    const response = await this.sendCommand(command);
+
+    if (response.includes('[PRB')) {
+      const match = response.match(/\[PRB:([\d.-]+),([\d.-]+),([\d.-]+):(\d)\]/);
+      if (match) {
+        return {
+          x: parseFloat(match[1]),
+          y: parseFloat(match[2]),
+          z: parseFloat(match[3]),
+          success: parseInt(match[4]) === 1,
+          axis: axis.toUpperCase(),
+          distance,
+          feedRate,
+          rawResponse: response,
+        };
+      }
+    }
+    throw new Error('Failed to parse probe response');
   }
 
   async probeGrid(
@@ -340,58 +323,57 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     const results: IGridProbeResult[] = [];
     const startX = -gridSize.x / 2;
     const startY = -gridSize.y / 2;
-    
-    // First, move to safe height
-    await this.sendCommand('G0 Z10');
-    await this.sendCommand('G0 X0 Y0'); // Start at center
-    
+    const safeZ = this.safetySystem.getSafeTravelHeight();
+
+    await this.sendCommand(`G0 Z${safeZ}`);
+    await this.sendCommand(`G0 X${startX} Y${startY}`);
+
     for (let y = 0; y <= gridSize.y; y += stepSize) {
       for (let x = 0; x <= gridSize.x; x += stepSize) {
-        // Move to position
         const targetX = startX + x;
         const targetY = startY + y;
         await this.sendCommand(`G0 X${targetX} Y${targetY}`);
-        
-        // Probe Z at this position
+
         try {
           const probeResult = await this.probe('Z', feedRate, -100);
-          const gridProbeResult: IGridProbeResult = {
-            ...probeResult,
-            gridPosition: { x: targetX, y: targetY }
-          };
-          results.push(gridProbeResult);
-          
-          // Raise probe after each point
+          results.push({ ...probeResult, gridPosition: { x: targetX, y: targetY } });
           await this.sendCommand('G0 Z10');
         } catch (error) {
-          console.error(`Probe failed at X${targetX} Y${targetY}:`, error);
-          // Add failed result with grid position
-          const failedResult: IGridProbeResult = {
+          results.push({
             x: 0,
             y: 0,
             z: 0,
             success: false,
             axis: 'Z',
             distance: -100,
-            feedRate: feedRate,
+            feedRate,
             rawResponse: (error as Error).message,
             error: 'Probe failed',
-            gridPosition: { x: targetX, y: targetY }
-          };
-          results.push(failedResult);
-          
-          // Continue with next point
+            gridPosition: { x: targetX, y: targetY },
+          });
           await this.sendCommand('G0 Z10');
         }
-        
-        // Small delay between points
         await new Promise(resolve => setTimeout(resolve, 50));
       }
     }
-    
-    // Return to start position
+
     await this.sendCommand('G0 X0 Y0 Z10');
-    
     return results;
+  }
+
+  getCurrentPosition(): IPosition {
+    return { ...this.currentPosition };
+  }
+
+  getSafetyStatus(): {
+    limits: SafetySystem['softLimits'];
+    isHomed: boolean;
+    isSafe: boolean;
+  } {
+    return {
+      limits: this.safetySystem.softLimits,
+      isHomed: this.isHomed,
+      isSafe: this.safetySystem.isSafeToMove(),
+    };
   }
 }
