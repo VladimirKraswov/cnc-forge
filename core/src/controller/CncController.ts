@@ -543,6 +543,7 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
         if (xMatch) positionChange.x = parseFloat(xMatch[1]);
         if (yMatch) positionChange.y = parseFloat(yMatch[1]);
         if (zMatch) positionChange.z = parseFloat(zMatch[1]);
+        else positionChange.z = 0;
 
         return positionChange;
     }

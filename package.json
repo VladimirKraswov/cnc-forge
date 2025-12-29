@@ -5,7 +5,8 @@
   "license": "MIT",
   "private": true,
   "scripts": {
-    "build": "yarn workspace core build && yarn workspace gui build"
+    "build": "yarn workspace core build && yarn workspace gui build",
+    "test": "jest"
   },
   "workspaces": [
     "core",
@@ -13,5 +14,10 @@
   ],
   "dependencies": {
     "@serialport/parser-readline": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6"
   }
 }
