@@ -10,11 +10,11 @@
   },
   "scripts": {
     "build": "vite build --config vite.main.config.ts",
-    "start": "npm run build && concurrently \"vite\" \"wait-on tcp:5173 && electron .\"",
-    "package": "npm run build && electron-builder",
-    "package:win": "npm run package -- --win",
-    "package:mac": "npm run package -- --mac",
-    "package:linux": "npm run package -- --linux"
+    "start": "yarn build && concurrently \"vite\" \"wait-on tcp:5173 && electron .\"",
+    "package": "yarn build && electron-builder",
+    "package:win": "yarn package -- --win",
+    "package:mac": "yarn package -- --mac",
+    "package:linux": "yarn package -- --linux"
   },
   "build": {
     "appId": "com.cncforge.gui",
