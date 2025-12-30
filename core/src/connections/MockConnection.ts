@@ -3,7 +3,7 @@ import { IConnectionOptions } from '../interfaces/Connection';
 
 export class MockConnection extends BaseConnection {
   public MOCK_send_response: string = 'ok';
-  private responses: Map<string, string> = new Map([
+  public responses: Map<string, string> = new Map([
     ['$H', 'ok'],
     ['$$', 'ok\n$0=10\n$1=25\n...'],
   ]);
