@@ -1,5 +1,5 @@
-import { GCodeParser } from './GCodeParser';
-import { MachineLimits } from './types';
+import { GCodeParser } from '../src/gcode/GCodeParser';
+import { MachineLimits } from '../src/gcode/types';
 
 describe('GCodeParser', () => {
   let parser: GCodeParser;
