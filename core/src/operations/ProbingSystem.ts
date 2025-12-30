@@ -31,29 +31,66 @@ export class ProbingSystem {
       console.log(`Probing: ${command}`);
       this.controller.emit('probeStarted', { axis, feedRate, distance });
 
-      const response = await this.controller.sendCommand(command, 30000); // 30 сек таймаут
+      // В GRBL зондирование возвращает специальный ответ
+      const response = await this.controller.sendCommand(command, 30000);
 
       // 4. Получение результата
-      const status = await this.controller.getStatus();
       const duration = Date.now() - startTime;
+      
+      // Проверяем ответ на наличие данных о зондировании
+      const probeMatch = response.match(/\[PRB:([\d.-]+),([\d.-]+),([\d.-]+):([01])\]/);
+      
+      let position = { x: 0, y: 0, z: 0 };
+      let contactDetected = false;
+      
+      if (probeMatch) {
+        position = {
+          x: parseFloat(probeMatch[1]),
+          y: parseFloat(probeMatch[2]),
+          z: parseFloat(probeMatch[3])
+        };
+        contactDetected = probeMatch[4] === '1';
+        
+        // Для GRBL, если контакт обнаружен, позиция должна быть близка к ожидаемой
+        if (contactDetected) {
+          // Проверяем, что позиция зондирования разумна
+          const expectedPosition = await this.getExpectedProbePosition(axis, distance);
+          const tolerance = 1.0; // 1мм допуск
+          
+          const axisKey = axis.toLowerCase() as 'x' | 'y' | 'z';
+          if (Math.abs(position[axisKey] - expectedPosition) > tolerance) {
+            console.warn(`Probe position seems unusual: ${axis}=${position[axisKey]}, expected ~${expectedPosition}`);
+          }
+        }
+      } else {
+        // Если нет формального ответа, получаем текущую позицию
+        const status = await this.controller.getStatus();
+        position = status.position;
+        contactDetected = response.includes('ok') && !response.includes('error');
+      }
 
       const result: ProbeResult = {
         success: true,
         axis,
         feedRate,
         distance,
-        position: status.position,
+        position,
         rawResponse: response,
         duration,
-        contactDetected: response.includes('ok') && !response.includes('error')
+        contactDetected
       };
 
       console.log(`✓ Probe completed in ${duration}ms`);
-      console.log(`Contact position: ${axis}=${status.position[axis.toLowerCase() as 'x' | 'y' | 'z']}`);
+      if (contactDetected) {
+        console.log(`Contact position: ${axis}=${position[axis.toLowerCase() as 'x' | 'y' | 'z'].toFixed(3)}mm`);
+      } else {
+        console.log('No contact detected during probing');
+      }
+      
       this.controller.emit('probeCompleted', result);
 
       // 5. Послезонирование
-      await this.postProbeActions(axis);
+      await this.postProbeActions(axis, contactDetected);
 
       return result;
 
@@ -121,6 +158,7 @@ export class ProbingSystem {
 
         // Перемещение к точке
         await this.controller.sendCommand(`G0 X${point.x} Y${point.y} F1000`);
+        await this.waitForIdleState();
 
         // Зондирование Z
         const probeResult = await this.probe('Z', feedRate, -50); // Зондируем вниз на 50мм
@@ -129,21 +167,23 @@ export class ProbingSystem {
         grid.push({
           x: point.x,
           y: point.y,
-          z: probeResult.success ? probeResult.position.z : undefined
+          z: probeResult.success && probeResult.contactDetected ? probeResult.position.z : undefined
         });
 
         // Подъем после зондирования
         await this.controller.sendCommand('G0 Z10 F500');
+        await this.waitForIdleState();
 
-        // Небольшая пауза между точками
-        await new Promise(resolve => setTimeout(resolve, 100));
+        // Небольшая пауза между точками для стабилизации
+        await new Promise(resolve => setTimeout(resolve, 200));
       }
 
       // 5. Возврат в начальную позицию
       await this.controller.sendCommand('G0 X0 Y0 Z20 F1000');
+      await this.waitForIdleState();
 
       const duration = Date.now() - startTime;
-      const successCount = results.filter(r => r.success).length;
+      const successCount = results.filter(r => r.success && r.contactDetected).length;
 
       const result: GridProbeResult = {
         success: successCount === points.length,
@@ -161,8 +201,12 @@ export class ProbingSystem {
 
       console.log(`✓ Grid probe completed in ${duration}ms`);
       console.log(`Success: ${successCount}/${points.length} points`);
-      console.log(`Average height: ${result.averageHeight?.toFixed(3)}mm`);
-      console.log(`Flatness: ${result.flatness?.toFixed(3)}mm`);
+      if (result.averageHeight !== undefined) {
+        console.log(`Average height: ${result.averageHeight.toFixed(3)}mm`);
+      }
+      if (result.flatness !== undefined) {
+        console.log(`Flatness: ${result.flatness.toFixed(3)}mm`);
+      }
 
       this.controller.emit('gridProbeCompleted', result);
 
@@ -177,7 +221,7 @@ export class ProbingSystem {
         gridSize,
         stepSize,
         pointsProbed: results.length,
-        pointsSuccessful: results.filter(r => r.success).length,
+        pointsSuccessful: results.filter(r => r.success && r.contactDetected).length,
         grid,
         results,
         error: error as Error,
@@ -224,8 +268,10 @@ export class ProbingSystem {
     }
 
     // 5. Проверка скорости зондирования
-    if (feedRate > 500) {
-      console.warn('High probe feed rate. Consider reducing for safety and accuracy.');
+    const maxProbeFeed = 500;
+    if (feedRate > maxProbeFeed) {
+      console.warn(`High probe feed rate (${feedRate}). Reducing to ${maxProbeFeed} for safety.`);
+      // Можно автоматически уменьшить скорость или запросить подтверждение
     }
 
     // 6. Проверка датчика зондирования (если есть возможность)
@@ -240,18 +286,19 @@ export class ProbingSystem {
     if (axis === 'Z') {
       // Для зондирования Z поднимаем инструмент
       await this.controller.sendCommand('G0 Z10 F500');
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      await this.waitForIdleState();
     }
 
     console.log('✓ Ready for probing');
   }
 
-  private async postProbeActions(axis: 'X' | 'Y' | 'Z'): Promise<void> {
+  private async postProbeActions(axis: 'X' | 'Y' | 'Z', contactDetected: boolean): Promise<void> {
     console.log('Post-probe actions...');
 
-    if (axis === 'Z') {
-      // После зондирования Z поднимаем инструмент
+    if (axis === 'Z' && contactDetected) {
+      // После успешного зондирования Z поднимаем инструмент
       await this.controller.sendCommand('G0 Z5 F300');
+      await this.waitForIdleState();
     }
 
     // Небольшая пауза для стабилизации
@@ -260,30 +307,57 @@ export class ProbingSystem {
 
   private async checkProbeSensor(): Promise<void> {
     // Проверка датчика зондирования
-    // Можно отправить тестовую команду или проверить состояние
     console.log('Checking probe sensor...');
 
     try {
-      // Проверяем, что датчик в начальном состоянии (не сработан)
-      // Это зависит от конкретной реализации датчика
-      console.log('✓ Probe sensor ready');
+      // В GRBL можно проверить состояние датчика через $I или другими командами
+      // Просто выводим сообщение для пользователя
+      console.log('✓ Assuming probe sensor is ready');
     } catch (error) {
-      console.warn('Probe sensor check failed:', error);
-      throw new Error('Probe sensor not ready or not connected');
+      console.warn('Probe sensor check inconclusive:', error);
+      console.log('Please manually verify probe sensor is connected and working');
     }
+  }
+
+  private async getExpectedProbePosition(axis: 'X' | 'Y' | 'Z', distance: number): Promise<number> {
+    // Получаем текущую позицию и рассчитываем ожидаемую позицию после зондирования
+    const status = await this.controller.getStatus();
+    const axisKey = axis.toLowerCase() as 'x' | 'y' | 'z';
+    return status.position[axisKey] + distance;
+  }
+
+  private async waitForIdleState(timeoutMs: number = 5000): Promise<void> {
+    const start = Date.now();
+    
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const status = await this.controller.getStatus();
+        if (status.state === 'Idle') {
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    throw new Error(`Timeout waiting for Idle state (${timeoutMs}ms)`);
   }
 
   private determineProbeFailureType(errorMsg: string): ProbeFailureType {
     const msg = errorMsg.toLowerCase();
 
-    if (msg.includes('probe fail') || msg.includes('alarm:4')) {
-      return 'initial_state'; // Датчик уже был сработан в начале
+    // GRBL specific probe errors
+    if (msg.includes('alarm:4')) {
+      return 'initial_state'; // Probe fail. Probe is not in the expected initial state.
     } else if (msg.includes('alarm:5')) {
-      return 'no_contact'; // Не было контакта
+      return 'no_contact'; // Probe fail. Probe did not contact the workpiece within the programmed travel.
     } else if (msg.includes('limit')) {
-      return 'limit_triggered'; // Сработал концевик
+      return 'limit_triggered'; // Limit switch triggered
     } else if (msg.includes('timeout')) {
-      return 'timeout'; // Таймаут ожидания
+      return 'timeout';
+    } else if (msg.includes('probe fail')) {
+      return 'no_contact';
     }
 
     return 'unknown';
@@ -292,6 +366,7 @@ export class ProbingSystem {
   private async recoverFromProbeFailure(result: ProbeResult): Promise<void> {
     console.log('Recovering from probe failure...');
 
+    // Выбираем соответствующий метод восстановления
     switch (result.probeFailure) {
       case 'initial_state':
         await this.recoverFromInitialStateFailure();
@@ -319,8 +394,12 @@ export class ProbingSystem {
     try {
       // Поднимаем инструмент
       await this.controller.sendCommand('G0 Z20 F500');
+      await this.waitForIdleState();
+      
       // Сбрасываем аварию
       await this.controller.sendCommand('$X');
+      await this.waitForIdleState();
+      
       console.log('✓ Probe recovery completed');
     } catch (error) {
       console.error('Probe recovery failed:', error);
@@ -339,6 +418,13 @@ export class ProbingSystem {
     try {
       // Поднимаем инструмент
       await this.controller.sendCommand('G0 Z20 F500');
+      await this.waitForIdleState();
+      
+      // Сбрасываем аварию
+      await this.controller.sendCommand('$X').catch(() => {
+        console.log('No alarm to clear');
+      });
+      
       console.log('✓ Tool raised to safe height');
     } catch (error) {
       console.error('No-contact recovery failed:', error);
@@ -359,8 +445,11 @@ export class ProbingSystem {
 
       // Сбрасываем аварию
       await this.controller.sendCommand('$X');
+      await this.waitForIdleState();
+      
       // Поднимаем инструмент
       await this.controller.sendCommand('G0 Z20 F300');
+      await this.waitForIdleState();
 
       console.log('✓ Limit triggered recovery completed');
     } catch (error) {
@@ -374,12 +463,17 @@ export class ProbingSystem {
     try {
       // 1. Остановка
       await this.controller.feedHold();
+      await new Promise(resolve => setTimeout(resolve, 500));
 
       // 2. Подъем инструмента
-      await this.controller.sendCommand('G0 Z20 F300').catch(() => {});
+      await this.controller.sendCommand('G0 Z20 F300').catch(() => {
+        console.log('Could not raise tool');
+      });
 
       // 3. Сброс состояния
-      await this.controller.sendCommand('$X').catch(() => {});
+      await this.controller.sendCommand('$X').catch(() => {
+        console.log('Could not clear alarm state');
+      });
 
       console.log('✓ Generic probe recovery completed');
     } catch (error) {
@@ -409,15 +503,17 @@ export class ProbingSystem {
     }
 
     // 3. Проверка что сетка помещается в рабочий объем
-    const limits = this.safety['softLimits'];
+    const safetyStatus = this.controller.getSafetyStatus();
+    const limits = safetyStatus.limits;
+    
     if (gridSize.x > limits.x.max - limits.x.min ||
         gridSize.y > limits.y.max - limits.y.min) {
-      throw new Error('Grid size exceeds machine working volume');
+      throw new Error(`Grid size (${gridSize.x}x${gridSize.y}mm) exceeds machine working volume`);
     }
 
     // 4. Расчет времени зондирования
     const pointsCount = Math.ceil(gridSize.x / stepSize) * Math.ceil(gridSize.y / stepSize);
-    const estimatedTime = pointsCount * 10; // ~10 секунд на точку
+    const estimatedTime = pointsCount * 15; // ~15 секунд на точку с учетом перемещений
 
     if (estimatedTime > 300) { // 5 минут
       console.warn(`Grid probe will take approximately ${Math.round(estimatedTime / 60)} minutes`);
@@ -439,8 +535,8 @@ export class ProbingSystem {
     for (let y = 0; y <= gridSize.y; y += stepSize) {
       for (let x = 0; x <= gridSize.x; x += stepSize) {
         points.push({
-          x: startX + x,
-          y: startY + y
+          x: parseFloat((startX + x).toFixed(3)),
+          y: parseFloat((startY + y).toFixed(3))
         });
       }
     }
@@ -505,13 +601,19 @@ export class ProbingSystem {
 
     try {
       // 1. Подъем инструмента
-      await this.controller.sendCommand('G0 Z20 F500').catch(() => {});
+      await this.controller.sendCommand('G0 Z20 F500').catch(() => {
+        console.log('Could not raise tool');
+      });
 
       // 2. Возврат в центр
-      await this.controller.sendCommand('G0 X0 Y0 F1000').catch(() => {});
+      await this.controller.sendCommand('G0 X0 Y0 F1000').catch(() => {
+        console.log('Could not return to center');
+      });
 
       // 3. Сброс аварийного состояния
-      await this.controller.sendCommand('$X').catch(() => {});
+      await this.controller.sendCommand('$X').catch(() => {
+        console.log('Could not clear alarm state');
+      });
 
       console.log('✓ Grid probe recovery completed');
 

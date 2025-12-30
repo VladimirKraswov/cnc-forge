@@ -5,7 +5,9 @@ export class MockConnection extends BaseConnection {
   public MOCK_send_response: string = 'ok';
   public responses: Map<string, string> = new Map([
     ['$H', 'ok'],
-    ['$$', 'ok\n$0=10\n$1=25\n...'],
+    ['$$', '$0=10\n$1=25\nok'],
+    ['$I', '[VER:1.1f.20230414]\nok'],
+    ['?', '<Idle|MPos:0.000,0.000,0.000|WPos:0.000,0.000,0.000|F:0>'],
   ]);
 
   constructor(options: IConnectionOptions) {
@@ -20,25 +22,32 @@ export class MockConnection extends BaseConnection {
   }
 
   async send(data: string): Promise<void> {
-    this.logCommand(data);
-    const response = this.responses.get(data.trim()) || this.MOCK_send_response;
-    process.nextTick(() => {
-      if (data.trim() === '?') {
-        this.emit('data', this.MOCK_send_response);
-      } else if (data.trim().startsWith('G38.2')) {
-        this.emit('data', '[PRB:0.000,0.000,0.000:1]');
+    return new Promise((resolve) => {
+      this.logCommand(data);
+      const trimmedData = data.trim();
+      let response: string;
+      
+      if (trimmedData === '?') {
+        response = this.responses.get(trimmedData) || this.MOCK_send_response;
+      } else if (trimmedData.startsWith('G38.2')) {
+        response = this.responses.get(trimmedData) || '[PRB:0.000,0.000,0.000:1]';
       } else {
-        this.emit('data', response);
+        response = this.responses.get(trimmedData) || this.MOCK_send_response;
       }
-      this.lastHeartbeat = new Date();
+      
+      process.nextTick(() => {
+        this.emit('data', response);
+        this.lastHeartbeat = new Date();
+        resolve(); // Разрешаем промис после отправки
+      });
     });
   }
 
   async disconnect(): Promise<void> {
     this.onDisconnect();
+    return Promise.resolve();
   }
 
-  // Method for testing failures
   simulateFailure(type: 'timeout' | 'noise' | 'disconnect'): void {
     switch (type) {
       case 'timeout':

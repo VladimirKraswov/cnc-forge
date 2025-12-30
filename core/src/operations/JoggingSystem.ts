@@ -6,12 +6,7 @@ export class JoggingSystem {
   private controller: CncController;
   private safety: SafetySystem;
   private isJogging: boolean = false;
-  private jogQueue: Array<{
-    axes: { x?: number; y?: number; z?: number };
-    feed: number;
-    resolve: () => void;
-    reject: (error: Error) => void;
-  }> = [];
+  private currentJogCommand: string | null = null;
 
   constructor(controller: CncController, safety: SafetySystem) {
     this.controller = controller;
@@ -26,6 +21,11 @@ export class JoggingSystem {
     const startTime = Date.now();
 
     try {
+      // Проверяем, что джоггинг еще не выполняется
+      if (this.isJogging) {
+        throw new Error('Jogging is already in progress. Wait for current jog to complete or use emergency stop.');
+      }
+
       // 1. Проверка безопасности
       await this.preJogSafetyCheck(axes, feed);
 
@@ -48,14 +48,23 @@ export class JoggingSystem {
       this.controller.emit('jogStarted', { axes, feed });
 
       this.isJogging = true;
-      const response = await this.controller.sendCommand(command);
+      this.currentJogCommand = command;
+      
+      // В GRBL джоггинг выполняется через $J= команду
+      // Таймаут зависит от расстояния и скорости
+      const estimatedTime = this.calculateEstimatedJogTime(axes, feed);
+      const timeout = Math.max(estimatedTime * 2, 10000); // Минимум 10 секунд
+      
+      const response = await this.controller.sendCommand(command, timeout);
+      
       this.isJogging = false;
+      this.currentJogCommand = null;
 
       const duration = Date.now() - startTime;
       const result: JogResult = {
         success: true,
         duration,
-        axes: Object.keys(axes),
+        axes: this.getActiveAxes(axes),
         distance: axes,
         feed,
         response
@@ -68,12 +77,13 @@ export class JoggingSystem {
 
     } catch (error) {
       this.isJogging = false;
+      this.currentJogCommand = null;
       const duration = Date.now() - startTime;
 
       const result: JogResult = {
         success: false,
         duration,
-        axes: Object.keys(axes),
+        axes: this.getActiveAxes(axes),
         distance: axes,
         feed,
         error: error as Error,
@@ -92,28 +102,19 @@ export class JoggingSystem {
     }
   }
 
-  // Непрерывный джогинг (для джойстика/ручного управления)
-  async startContinuousJog(
-    axis: 'x' | 'y' | 'z',
-    direction: 1 | -1,
-    feed: number
-  ): Promise<void> {
-    // Реализация непрерывного джогинга
-    // Отправляет команду и держит движение пока не будет остановки
-  }
-
-  async stopContinuousJog(): Promise<void> {
-    // Остановка непрерывного джогинга
-    await this.controller.sendCommand('!'); // Feed hold
-  }
-
   // Аварийная остановка джогинга
   async emergencyStopJog(): Promise<void> {
     console.log('Emergency jog stop');
+    
+    if (!this.isJogging) {
+      console.log('No jog in progress');
+      return;
+    }
+    
     this.isJogging = false;
-    this.jogQueue = []; // Очищаем очередь
+    this.currentJogCommand = null;
 
-    // Останавливаем станок
+    // В GRBL аварийная остановка - это мягкий сброс (Ctrl-X или 0x18)
     await this.controller.emergencyStop();
 
     this.controller.emit('jogEmergencyStop');
@@ -144,14 +145,24 @@ export class JoggingSystem {
     }
 
     // 4. Проверка скорости
-    if (feed > 3000) {
-      console.warn('High jog feed rate. Consider reducing for safety.');
+    const maxFeed = 5000; // Максимальная безопасная скорость
+    if (feed > maxFeed) {
+      throw new Error(`Feed rate ${feed} exceeds maximum safe rate ${maxFeed}`);
     }
 
-    // 5. Проверка одновременного движения по нескольким осям
-    const axisCount = Object.keys(axes).filter(k => axes[k as keyof typeof axes] !== undefined).length;
-    if (axisCount > 2) {
-      console.warn('Jogging on 3 axes simultaneously. Consider moving one axis at a time for better control.');
+    // 5. Проверка что движение не выйдет за пределы рабочей зоны
+    const currentPos = await this.controller.getStatus();
+    const limits = this.safety.getSoftLimits ? this.safety.getSoftLimits() : safetyStatus.limits;
+    
+    for (const axis of ['x', 'y', 'z'] as const) {
+      const distance = axes[axis];
+      if (distance !== undefined) {
+        const newPos = currentPos.position[axis] + distance;
+        
+        if (newPos < limits[axis].min || newPos > limits[axis].max) {
+          throw new Error(`Jog would move ${axis.toUpperCase()} to ${newPos}mm, which is outside soft limits (${limits[axis].min} to ${limits[axis].max}mm)`);
+        }
+      }
     }
 
     console.log('✓ Pre-jog safety checks passed');
@@ -163,15 +174,46 @@ export class JoggingSystem {
   ): string {
     const axisCommands: string[] = [];
 
-    if (axes.x !== undefined) axisCommands.push(`X${axes.x}`);
-    if (axes.y !== undefined) axisCommands.push(`Y${axes.y}`);
-    if (axes.z !== undefined) axisCommands.push(`Z${axes.z}`);
-
-    if (axisCommands.length === 0) {
-      throw new Error('No axes specified for jogging');
+    // Для GRBL требуется указать только оси, которые двигаются
+    // Не указываем оси с нулевым перемещением
+    if (axes.x !== undefined && axes.x !== 0) {
+      axisCommands.push(`X${axes.x}`);
+    }
+    if (axes.y !== undefined && axes.y !== 0) {
+      axisCommands.push(`Y${axes.y}`);
+    }
+    if (axes.z !== undefined && axes.z !== 0) {
+      axisCommands.push(`Z${axes.z}`);
     }
 
+    if (axisCommands.length === 0) {
+      throw new Error('No movement specified for jogging');
+    }
+
+    // Команда джоггинга в GRBL: $J=G91 X.. Y.. Z.. F..
     return `$J=G91 ${axisCommands.join(' ')} F${feed}`;
+  }
+
+  private getActiveAxes(axes: { x?: number; y?: number; z?: number }): string[] {
+    return Object.entries(axes)
+      .filter(([_, value]) => value !== undefined && value !== 0)
+      .map(([key]) => key);
+  }
+
+  private calculateEstimatedJogTime(
+    axes: { x?: number; y?: number; z?: number },
+    feed: number
+  ): number {
+    // Рассчитываем максимальное расстояние (по теореме Пифагора для многомерного движения)
+    const distances = Object.values(axes).filter(d => d !== undefined) as number[];
+    const maxDistance = Math.max(...distances.map(Math.abs));
+    
+    // Время = расстояние / скорость (в мм/мин, переводим в мм/сек)
+    const feedPerSecond = feed / 60;
+    const estimatedTime = maxDistance / feedPerSecond * 1000; // в миллисекундах
+    
+    // Добавляем запас на ускорение/замедление
+    return estimatedTime * 1.5;
   }
 
   private shouldRecoverFromJogError(error: Error): boolean {
@@ -230,12 +272,17 @@ export class JoggingSystem {
 
   private async recoverFromAlarm(): Promise<void> {
     // Восстановление после аварии
-    await this.controller.softReset();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    try {
+      await this.controller.softReset();
+      await new Promise(resolve => setTimeout(resolve, 1000));
 
-    // Проверяем состояние
-    const status = await this.controller.getStatus();
-    console.log(`Machine state after recovery: ${status.state}`);
+      // Проверяем состояние
+      const status = await this.controller.getStatus();
+      console.log(`Machine state after recovery: ${status.state}`);
+    } catch (error) {
+      console.error('Failed to recover from alarm:', error);
+      console.log('Try manual recovery with $X command');
+    }
   }
 
   private async genericJogRecovery(): Promise<void> {
@@ -243,12 +290,20 @@ export class JoggingSystem {
     try {
       // 1. Остановка
       await this.controller.feedHold();
+      await new Promise(resolve => setTimeout(resolve, 500));
 
-      // 2. Подъем Z для безопасности
-      await this.controller.sendCommand('G0 Z20 F300').catch(() => {});
+      // 2. Подъем Z для безопасности (если Z не был затронут)
+      const status = await this.controller.getStatus().catch(() => null);
+      if (status && status.position.z < 20) {
+        await this.controller.sendCommand('G0 Z20 F300').catch(() => {
+          console.warn('Could not raise Z axis');
+        });
+      }
 
       // 3. Сброс состояния
-      await this.controller.sendCommand('$X').catch(() => {});
+      await this.controller.sendCommand('$X').catch(() => {
+        console.warn('Could not clear alarm state');
+      });
 
       console.log('✓ Generic jog recovery completed');
     } catch (error) {
@@ -260,7 +315,7 @@ export class JoggingSystem {
     return this.isJogging;
   }
 
-  getJogQueueLength(): number {
-    return this.jogQueue.length;
+  getCurrentJogCommand(): string | null {
+    return this.currentJogCommand;
   }
 }

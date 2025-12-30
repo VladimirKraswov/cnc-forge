@@ -27,6 +27,11 @@ export class SafetySystem implements ISafetySystem {
     'G38.5', // Probing
   ];
 
+  // Добавлен геттер для совместимости
+  getSoftLimits() {
+    return this.softLimits;
+  }
+
   validateCommand(command: string): ValidationResult {
     const trimmed = command.trim().toUpperCase();
 
@@ -148,5 +153,15 @@ export class SafetySystem implements ISafetySystem {
   private parseFeedRate(command: string): number | null {
     const fMatch = command.match(/F([\d.-]+)/);
     return fMatch ? parseFloat(fMatch[1]) : null;
+  }
+
+  // Метод для установки новых пределов
+  setSoftLimits(limits: typeof this.softLimits): void {
+    this.softLimits = { ...limits };
+  }
+
+  // Метод для получения текущих скоростных ограничений
+  getSpeedLimits() {
+    return { ...this.speedLimits };
   }
 }

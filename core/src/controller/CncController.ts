@@ -89,6 +89,7 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     await this.connection.disconnect();
     this.connection = null;
     this.connected = false;
+    this.stopStatusPolling();
   }
 
   isConnected(): boolean {
@@ -164,7 +165,8 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
         this.updatePosition(status.position);
         this.emit('status', status);
       } catch (error) {
-        // Ignore parsing errors
+        console.warn('Failed to parse GRBL status:', trimmedData);
+        // Ignore parsing errors but log them
       }
     }
 
@@ -174,6 +176,16 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
       const alarmMessage = this.getAlarmMessage(alarmCode);
       const alarm: IAlarm = { code: alarmCode, message: alarmMessage };
       this.emit('alarm', alarm);
+    }
+
+    // Handle probe responses
+    if (trimmedData.includes('[PRB:')) {
+      this.emit('probeResponse', trimmedData);
+    }
+
+    // Handle ok responses
+    if (trimmedData === 'ok') {
+      this.emit('commandResponse', trimmedData);
     }
   }
 
@@ -192,35 +204,63 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     return messages[code] || `Unknown alarm code: ${code}`;
   }
 
-  private parseGrblStatus(response: string): IGrblStatus {
-    const match = response.match(
-      /<(\w+)\|MPos:([\d.-]+),([\d.-]+),([\d.-]+)\|WPos:([\d.-]+),([\d.-]+),([\d.-]+)\|F:([\d.-]+)>/
-    );
-    if (match) {
-      return {
-        state: match[1] as IGrblStatus['state'],
-        position: { x: parseFloat(match[2]), y: parseFloat(match[3]), z: parseFloat(match[4]) },
-        feed: parseFloat(match[8]),
-      };
-    }
-    throw new Error(`Cannot parse status: ${response}`);
+private parseGrblStatus(response: string): IGrblStatus {
+  const match = response.match(
+    /<(\w+)\|MPos:([\d.-]+),([\d.-]+),([\d.-]+)\|WPos:([\d.-]+),([\d.-]+),([\d.-]+)\|F:([\d.-]+)>/
+  );
+  if (match) {
+    return {
+      state: match[1] as IGrblStatus['state'],
+      position: { 
+        x: parseFloat(match[2]), 
+        y: parseFloat(match[3]), 
+        z: parseFloat(match[4]) 
+      },
+      feed: parseFloat(match[8]),
+    };
   }
+  
+  // Try alternative format (some GRBL versions may have different format)
+  const altMatch = response.match(
+    /<(\w+)\|MPos:([\d.-]+),([\d.-]+),([\d.-]+)\|FS:([\d.-]+),([\d.-]+)>/
+  );
+  if (altMatch) {
+    return {
+      state: altMatch[1] as IGrblStatus['state'],
+      position: { 
+        x: parseFloat(altMatch[2]), 
+        y: parseFloat(altMatch[3]), 
+        z: parseFloat(altMatch[4]) 
+      },
+      feed: parseFloat(altMatch[5]),
+    };
+  }
+  
+  throw new Error(`Cannot parse status: ${response}`);
+}
 
   async getStatus(): Promise<IGrblStatus> {
-    const response = await this.sendCommand('?');
-    return this.parseGrblStatus(response);
+    try {
+      const response = await this.sendCommand('?', 5000); // 5 second timeout for status
+      return this.parseGrblStatus(response);
+    } catch (error) {
+      console.error('Failed to get status:', error);
+      throw new Error(`Failed to get machine status: ${(error as Error).message}`);
+    }
   }
 
   startStatusPolling(intervalMs: number = 250): void {
     if (this.statusPollingIntervalId) {
       this.stopStatusPolling();
     }
+    
     this.statusPollingIntervalId = setInterval(async () => {
       if (this.isConnected()) {
         try {
-          await this.sendCommand('?');
+          await this.sendCommand('?', 1000); // 1 second timeout for polling
         } catch (error) {
-          // Don't emit errors for polling
+          // Don't emit errors for polling, but log them
+          console.debug('Status polling error:', error);
         }
       }
     }, intervalMs);
@@ -234,7 +274,12 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   }
 
   async home(axes?: string): Promise<HomingResult> {
-    return this.homingSystem.home(axes);
+    const result = await this.homingSystem.home(axes);
+    // Update homed state based on result
+    if (result.success) {
+      this.isHomed = true;
+    }
+    return result;
   }
 
   async jog(
@@ -267,17 +312,29 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     const total = lines.length;
 
     for (const line of lines) {
-      const response = await this.sendCommand(line);
-      if (response.includes('error') || response.includes('alarm')) {
-        throw new Error(`Error sending G-code: ${response}`);
+      try {
+        const response = await this.sendCommand(line);
+        
+        // Check for errors in response
+        if (response.includes('error') || response.includes('ALARM:')) {
+          throw new Error(`Error sending G-code: ${response}`);
+        }
+        
+        processed++;
+        this.emit('jobProgress', {
+          current: processed,
+          total,
+          line,
+          percentage: Math.round((processed / total) * 100),
+        });
+        
+        // Small delay between commands to avoid overwhelming the controller
+        await new Promise(resolve => setTimeout(resolve, 10));
+      } catch (error) {
+        console.error(`Error at line ${processed + 1}: ${line}`, error);
+        this.emit('jobError', { line, error, processed });
+        throw error;
       }
-      processed++;
-      this.emit('jobProgress', {
-        current: processed,
-        total,
-        line,
-        percentage: Math.round((processed / total) * 100),
-      });
     }
     this.emit('jobComplete');
   }
@@ -285,11 +342,16 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   async emergencyStop(): Promise<void> {
     try {
       await this.connection?.send('\x18'); // Ctrl-X for soft-reset
+      this.commandManager.clear();
+      this.emit('emergencyStop');
+      
+      // Reset expected position after emergency stop
+      this.expectedPosition = { ...this.lastKnownPosition };
     } catch (error) {
-      // Ignore errors during emergency stop
+      console.error('Emergency stop error:', error);
+      // Even if there's an error, we consider the emergency stop executed
+      this.emit('emergencyStop');
     }
-    this.commandManager.clear();
-    this.emit('emergencyStop');
   }
 
   async feedHold(): Promise<void> {
@@ -297,6 +359,7 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
       await this.connection?.send('!');
       this.emit('feedHold');
     } catch (error) {
+      console.error('Feed hold error:', error);
       this.emit('error', error as Error);
     }
   }
@@ -305,29 +368,46 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     if (!this.connection || !this.isConnected()) {
       throw new Error('Not connected');
     }
-    this.connection.send('!');
-    return Promise.resolve('');
+    
+    try {
+      await this.connection.send('!');
+      return 'Job stopped';
+    } catch (error) {
+      console.error('Stop job error:', error);
+      throw new Error(`Failed to stop job: ${(error as Error).message}`);
+    }
   }
 
   async softReset(): Promise<void> {
     try {
       await this.connection?.send('\x18'); // Ctrl-X
       await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Clear any pending commands
+      this.commandManager.clear();
+      
+      // Reset expected position
+      this.expectedPosition = { ...this.lastKnownPosition };
+      
       this.emit('softReset');
     } catch (error) {
+      console.error('Soft reset error:', error);
       this.emit('error', error as Error);
     }
   }
 
-  async getSettings(): Promise<string[]> {
-    const response = await this.sendCommand('$$');
-    return response.split('\n').filter((line) => line.trim());
-  }
+async getSettings(): Promise<string[]> {
+  const response = await this.sendCommand('$$');
+  return response.split('\n')
+    .filter((line) => line.trim() && !line.includes('ok'))
+    .filter((line) => line.startsWith('$')); // Фильтруем только строки настроек
+}
 
-  async getInfo(): Promise<string[]> {
-    const response = await this.sendCommand('$I');
-    return response.split('\n').filter((line) => line.trim());
-  }
+async getInfo(): Promise<string[]> {
+  const response = await this.sendCommand('$I');
+  return response.split('\n')
+    .filter((line) => line.trim() && !line.includes('ok'));
+}
 
   async checkGCode(gcode: string): Promise<string> {
     await this.sendCommand('$C');
@@ -357,12 +437,12 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   }
 
   getSafetyStatus(): {
-    limits: SafetySystem['softLimits'];
+    limits: { x: { min: number; max: number }; y: { min: number; max: number }; z: { min: number; max: number } };
     isHomed: boolean;
     isSafe: boolean;
   } {
     return {
-      limits: this.safetySystem.softLimits,
+      limits: this.safetySystem.getSoftLimits ? this.safetySystem.getSoftLimits() : this.safetySystem.softLimits,
       isHomed: this.isHomed,
       isSafe: this.safetySystem.isSafeToMove(),
     };
@@ -371,6 +451,10 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   // Автоматическая диагностика
   async autoDiagnose(): Promise<void> {
     try {
+      if (!this.isConnected()) {
+        return; // Skip diagnosis if not connected
+      }
+
       const diagnosis = await this.recoverySystem.diagnose(this);
 
       if (diagnosis.state !== RecoveryState.Normal) {
@@ -466,18 +550,15 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
         if (xMatch) positionChange.x = parseFloat(xMatch[1]);
         if (yMatch) positionChange.y = parseFloat(yMatch[1]);
         if (zMatch) positionChange.z = parseFloat(zMatch[1]);
-        else positionChange.z = 0;
+        // Не добавляем z=0 по умолчанию для команд джоггинга
 
-        return positionChange;
+        return Object.keys(positionChange).length > 0 ? positionChange : undefined;
     }
 
     return undefined;
   }
 
   public checkPositionMismatch(): boolean {
-    // Сравниваем ожидаемую позицию с последней известной
-    // В реальности нужно получать актуальную позицию со станка
-
     const tolerance = 0.1; // 0.1 мм
     const diffX = Math.abs(this.expectedPosition.x - this.lastKnownPosition.x);
     const diffY = Math.abs(this.expectedPosition.y - this.lastKnownPosition.y);
@@ -489,5 +570,15 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
   // Обновление последней известной позиции
   updatePosition(position: IPosition): void {
     this.lastKnownPosition = { ...position };
+  }
+
+  // Очистка журнала команд
+  clearCommandJournal(): void {
+    this.commandJournal = [];
+  }
+
+  // Получение журнала команд
+  getCommandJournal(): Array<{ command: string; timestamp: Date; expectedPositionChange?: Partial<IPosition> }> {
+    return [...this.commandJournal];
   }
 }

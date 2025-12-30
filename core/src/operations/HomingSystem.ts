@@ -14,7 +14,7 @@ export class HomingSystem {
   }
 
   private setupHomingSequence(): void {
-    // Стандартная последовательность хоминга для 3-осевого станка
+    // Стандартная последовательность хоминга для 3-осевого станка по GRBL протоколу
     this.homingSequence = [
       {
         id: 'pre_home_check',
@@ -35,37 +35,17 @@ export class HomingSystem {
         retryable: true
       },
       {
-        id: 'home_z',
-        description: 'Хоминг оси Z',
+        id: 'home_all',
+        description: 'Хоминг всех осей (команда $H)',
         action: async () => {
-          await this.homeAxis('Z');
+          await this.homeAllAxes();
         },
         critical: true,
         retryable: true,
         maxRetries: 3
       },
       {
-        id: 'home_x',
-        description: 'Хоминг оси X',
-        action: async () => {
-          await this.homeAxis('X');
-        },
-        critical: true,
-        retryable: true,
-        maxRetries: 3
-      },
-      {
-        id: 'home_y',
-        description: 'Хоминг оси Y',
-        action: async () => {
-          await this.homeAxis('Y');
-        },
-        critical: true,
-        retryable: true,
-        maxRetries: 3
-      },
-      {
-        id: 'post_home',
+        id: 'move_to_zero',
         description: 'Перемещение в нулевую позицию',
         action: async () => {
           await this.moveToZeroPosition();
@@ -103,9 +83,9 @@ export class HomingSystem {
         throw new Error('Станок в аварийном состоянии. Сначала выполните восстановление.');
       }
 
-      // Если указаны конкретные оси, фильтруем последовательность
+      // Если указаны конкретные оси, используем индивидуальный хоминг
       const sequence = axes
-        ? this.filterSequenceForAxes(axes)
+        ? this.createSequenceForSpecificAxes(axes)
         : this.homingSequence;
 
       console.log(`Начинаем хоминг ${axes || 'всех осей'}...`);
@@ -222,6 +202,8 @@ export class HomingSystem {
     console.log('Хоминг прерван по команде пользователя');
     this.controller.emit('homingAborted');
     // Здесь должна быть логика безопасной остановки
+    // Например, отправка команды остановки
+    this.controller.emergencyStop().catch(console.error);
   }
 
   private async preHomeSafetyCheck(): Promise<void> {
@@ -246,8 +228,9 @@ export class HomingSystem {
     }
 
     // 4. Проверка позиции Z (чтобы не врезался при хоминге X/Y)
-    if (status.position.z < 10) {
-      console.warn('Внимание: ось Z находится низко. Поднимаем для безопасности...');
+    const safeHeight = this.safety.getSafeTravelHeight ? this.safety.getSafeTravelHeight() : 20;
+    if (status.position.z < safeHeight) {
+      console.warn(`Внимание: ось Z находится низко (${status.position.z}мм). Поднимаем для безопасности...`);
       await this.raiseZToSafeHeight();
     }
 
@@ -255,19 +238,33 @@ export class HomingSystem {
   }
 
   private async raiseZToSafeHeight(): Promise<void> {
-    const safeHeight = this.safety.getSafeTravelHeight();
+    const safeHeight = this.safety.getSafeTravelHeight ? this.safety.getSafeTravelHeight() : 20;
     console.log(`Поднимаем ось Z до безопасной высоты (${safeHeight}мм)...`);
 
     await this.controller.sendCommand(`G0 Z${safeHeight} F500`);
-    await new Promise(resolve => setTimeout(resolve, 1000)); // Ждем завершения
+    
+    // Ждем завершения перемещения
+    await this.waitForIdleState(5000);
 
     console.log('✓ Ось Z в безопасном положении');
   }
 
-  private async homeAxis(axis: 'X' | 'Y' | 'Z'): Promise<void> {
+  private async homeAllAxes(): Promise<void> {
+    console.log('Хоминг всех осей...');
+
+    // В GRBL команда $H хоминит все оси сразу
+    await this.controller.sendCommand('$H');
+
+    // Ждем завершения хоминга
+    await this.waitForHomingComplete();
+
+    console.log('✓ Все оси успешно прохомены');
+  }
+
+  private async homeSpecificAxis(axis: 'X' | 'Y' | 'Z'): Promise<void> {
     console.log(`Хоминг оси ${axis}...`);
 
-    // Отправляем команду хоминга
+    // В GRBL 1.1+ поддерживается хоминг отдельных осей
     await this.controller.sendCommand(`$H${axis}`);
 
     // Ждем завершения хоминга
@@ -276,35 +273,85 @@ export class HomingSystem {
     console.log(`✓ Ось ${axis} успешно прохомена`);
   }
 
-  private async waitForHomingComplete(axis: string): Promise<void> {
-    const timeout = 30000; // 30 секунд максимум
-    const start = Date.now();
-    let lastState = '';
+  private createSequenceForSpecificAxes(axes: string): HomingStep[] {
+    const axisList = axes.toUpperCase().split('');
+    const sequence: HomingStep[] = [];
 
-    while (Date.now() - start < timeout) {
-      try {
-        const status = await this.controller.getStatus();
+    // Всегда добавляем предварительные проверки
+    sequence.push(this.homingSequence[0]); // pre_home_check
+    sequence.push(this.homingSequence[1]); // raise_z (если нужно)
 
-        if (status.state === 'Idle' && lastState === 'Home') {
-          // Хоминг завершен
-          return;
-        }
-
-        lastState = status.state;
-
-        if (status.state === 'Alarm') {
-          throw new Error(`Станок перешел в аварийное состояние во время хоминга оси ${axis}`);
-        }
-
-        // Ждем немного перед следующей проверкой
-        await new Promise(resolve => setTimeout(resolve, 100));
-      } catch (error) {
-        // Игнорируем временные ошибки связи
-        await new Promise(resolve => setTimeout(resolve, 500));
+    // Для каждой оси добавляем свой шаг хоминга
+    for (const axis of axisList) {
+      if (['X', 'Y', 'Z'].includes(axis)) {
+        sequence.push({
+          id: `home_${axis.toLowerCase()}`,
+          description: `Хоминг оси ${axis}`,
+          action: async () => {
+            await this.homeSpecificAxis(axis as 'X' | 'Y' | 'Z');
+          },
+          critical: true,
+          retryable: true,
+          maxRetries: 3
+        });
       }
     }
 
-    throw new Error(`Таймаут хоминга оси ${axis}`);
+    // Добавляем завершающие шаги
+    sequence.push(this.homingSequence[3]); // move_to_zero
+    sequence.push(this.homingSequence[4]); // verify_home
+
+    return sequence;
+  }
+
+private async waitForHomingComplete(axis?: string): Promise<void> {
+  const timeout = 60000; // 60 секунд максимум для хоминга
+  const start = Date.now();
+  let lastState = '';
+
+  while (Date.now() - start < timeout) {
+    try {
+      const status = await this.controller.getStatus();
+
+      // В GRBL после хоминга состояние может быть 'Home' или 'Idle'
+      if (['Idle', 'Home'].includes(status.state) && (lastState === 'Home' || lastState === 'Run')) {
+        // Хоминг завершен
+        return;
+      }
+
+      lastState = status.state;
+
+      if (status.state === 'Alarm') {
+        throw new Error(`Станок перешел в аварийное состояние во время хоминга${axis ? ` оси ${axis}` : ''}`);
+      }
+
+      // Ждем немного перед следующей проверкой
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } catch (error) {
+      // Игнорируем временные ошибки связи
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+  }
+
+  throw new Error(`Таймаут хоминга${axis ? ` оси ${axis}` : ''}`);
+}
+
+  private async waitForIdleState(timeoutMs: number = 10000): Promise<void> {
+    const start = Date.now();
+    
+    while (Date.now() - start < timeoutMs) {
+      try {
+        const status = await this.controller.getStatus();
+        if (status.state === 'Idle') {
+          return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    throw new Error(`Таймаут ожидания состояния Idle (${timeoutMs}ms)`);
   }
 
   private async moveToZeroPosition(): Promise<void> {
@@ -312,54 +359,37 @@ export class HomingSystem {
 
     // Перемещаемся в X0 Y0, Z остается на безопасной высоте
     await this.controller.sendCommand('G0 X0 Y0 F1000');
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    // Ждем завершения перемещения
+    await this.waitForIdleState(5000);
 
     console.log('✓ Позиция установлена в X0 Y0');
   }
 
-  private async verifyHomingSuccess(): Promise<void> {
-    console.log('Проверяем успешность хоминга...');
+private async verifyHomingSuccess(): Promise<void> {
+  console.log('Проверяем успешность хоминга...');
 
-    const status = await this.controller.getStatus();
+  const status = await this.controller.getStatus();
 
-    // Проверяем, что позиция близка к нулю (допуск 0.1мм)
-    const tolerance = 0.1;
-    if (
-      Math.abs(status.position.x) > tolerance ||
-      Math.abs(status.position.y) > tolerance ||
-      Math.abs(status.position.z) > tolerance
-    ) {
-      throw new Error(`Позиция после хоминга отличается от нуля: X${status.position.x}, Y${status.position.y}, Z${status.position.z}`);
-    }
-
-    console.log('✓ Хоминг успешно проверен');
+  // В GRBL после хоминга допустимы оба состояния: 'Home' и 'Idle'
+  const validStatesAfterHoming = ['Idle', 'Home'];
+  
+  if (!validStatesAfterHoming.includes(status.state)) {
+    throw new Error(`Станок не в допустимом состоянии после хоминга. Текущее состояние: ${status.state}`);
   }
 
-  private filterSequenceForAxes(axes: string): HomingStep[] {
-    const axisList = axes.toUpperCase().split('');
-    const filtered: HomingStep[] = [];
-
-    // Всегда добавляем предварительные проверки
-    filtered.push(this.homingSequence[0]); // pre_home_check
-    filtered.push(this.homingSequence[1]); // raise_z (если нужно)
-
-    // Добавляем шаги для указанных осей
-    for (const axis of axisList) {
-      if (axis === 'Z') {
-        filtered.push(this.homingSequence[2]); // home_z
-      } else if (axis === 'X') {
-        filtered.push(this.homingSequence[3]); // home_x
-      } else if (axis === 'Y') {
-        filtered.push(this.homingSequence[4]); // home_y
-      }
-    }
-
-    // Добавляем завершающие шаги
-    filtered.push(this.homingSequence[5]); // post_home
-    filtered.push(this.homingSequence[6]); // verify_home
-
-    return filtered;
+  // Проверяем, что позиция близка к нулю (допуск 0.1мм)
+  const tolerance = 0.1;
+  if (
+    Math.abs(status.position.x) > tolerance ||
+    Math.abs(status.position.y) > tolerance ||
+    Math.abs(status.position.z) > tolerance
+  ) {
+    throw new Error(`Позиция после хоминга отличается от нуля: X${status.position.x}, Y${status.position.y}, Z${status.position.z}`);
   }
+
+  console.log('✓ Хоминг успешно проверен');
+}
 
   private async retryStep(step: HomingStep, error: Error): Promise<boolean> {
     console.log(`Повторяем шаг ${step.id}...`);
@@ -389,6 +419,7 @@ export class HomingSystem {
     // В зависимости от шага, разные действия
     switch (step.id) {
       case 'home_z':
+      case 'home_all':
         console.log('Рекомендации:');
         console.log('1. Проверьте, свободно ли движется ось Z');
         console.log('2. Проверьте концевик Z');
@@ -456,7 +487,7 @@ export class HomingSystem {
       instructions.push(`Ошибка: ${lastStep.error?.message}`);
 
       // Специфичные инструкции в зависимости от шага
-      if (lastStep.stepId.includes('home_z')) {
+      if (lastStep.stepId.includes('home_z') || lastStep.stepId === 'home_all') {
         instructions.push('1. Проверьте, не заклинило ли ось Z');
         instructions.push('2. Проверьте концевик оси Z');
         instructions.push('3. Попробуйте подвигать ось Z вручную');
