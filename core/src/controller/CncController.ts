@@ -8,12 +8,20 @@ import { CommandManager } from '../command/CommandManager';
 import { SafetySystem } from '../safety/SafetySystem';
 import { RecoverySystem, RecoveryDiagnosis, RecoveryState } from '../recovery/RecoverySystem';
 import { HomingSystem, JoggingSystem, ProbingSystem, HomingResult, JogResult, ProbeResult, GridProbeResult } from '../operations';
+import { GCodeParser } from '../gcode/GCodeParser';
+import { JobManager } from '../job/JobManager';
+import { Job, JobLoadResult, JobOptions, JobResumeResult, JobStartResult } from '../job/types';
+import { ExecutionStats } from '../job/types';
+import { GCodeParseResult, MachineLimits, SafetyCheckResult } from '../gcode/types';
 
 export class CncController extends EventEmitter implements ICncControllerCore, ICncEventEmitter {
+  private machineProfile: MachineLimits;
   private connection: IConnection | null = null;
   private commandManager: CommandManager;
   private safetySystem: SafetySystem;
   private recoverySystem: RecoverySystem;
+  private parser: GCodeParser;
+  private jobManager: JobManager;
   public homingSystem: HomingSystem;
   public joggingSystem: JoggingSystem;
   public probingSystem: ProbingSystem;
@@ -42,7 +50,10 @@ export class CncController extends EventEmitter implements ICncControllerCore, I
     super();
     this.commandManager = new CommandManager();
     this.safetySystem = new SafetySystem();
+    this.machineProfile = this.getDefaultMachineLimits();
     this.recoverySystem = new RecoverySystem();
+    this.parser = new GCodeParser();
+    this.jobManager = new JobManager(this, this.parser, this.safetySystem, this.machineProfile);
     this.homingSystem = new HomingSystem(this, this.safetySystem);
     this.joggingSystem = new JoggingSystem(this, this.safetySystem);
     this.probingSystem = new ProbingSystem(this, this.safetySystem);
@@ -289,54 +300,33 @@ private parseGrblStatus(response: string): IGrblStatus {
     return this.joggingSystem.jog(axes, feed);
   }
 
-  async streamGCode(
-    gcodeOrFile: string,
-    isFile: boolean = false
-  ): Promise<void> {
-    let gcode: string;
-    if (isFile) {
-      try {
-        gcode = await fs.readFile(gcodeOrFile, 'utf8');
-      } catch (err) {
-        throw new Error(`Error reading file: ${(err as Error).message}`);
-      }
-    } else {
-      gcode = gcodeOrFile;
-    }
+  // Public methods for job management
+  async loadJob(
+    source: string | File,
+    name?: string,
+    options?: JobOptions
+  ): Promise<JobLoadResult> {
+    return this.jobManager.loadJob(source, name, options);
+  }
 
-    const lines = gcode
-      .split('\n')
-      .filter((line) => line.trim() && !line.startsWith(';'));
+  async startJob(jobId?: string): Promise<JobStartResult> {
+    return this.jobManager.startJob(jobId);
+  }
 
-    let processed = 0;
-    const total = lines.length;
+  async pauseJob(): Promise<void> {
+    return this.jobManager.pauseJob();
+  }
 
-    for (const line of lines) {
-      try {
-        const response = await this.sendCommand(line);
-        
-        // Check for errors in response
-        if (response.includes('error') || response.includes('ALARM:')) {
-          throw new Error(`Error sending G-code: ${response}`);
-        }
-        
-        processed++;
-        this.emit('jobProgress', {
-          current: processed,
-          total,
-          line,
-          percentage: Math.round((processed / total) * 100),
-        });
-        
-        // Small delay between commands to avoid overwhelming the controller
-        await new Promise(resolve => setTimeout(resolve, 10));
-      } catch (error) {
-        console.error(`Error at line ${processed + 1}: ${line}`, error);
-        this.emit('jobError', { line, error, processed });
-        throw error;
-      }
-    }
-    this.emit('jobComplete');
+  async resumeJob(): Promise<void> {
+    return this.jobManager.resumeJob();
+  }
+
+  async stopJob(emergency: boolean = false): Promise<void> {
+    return this.jobManager.stopJob(emergency);
+  }
+
+  async resumeAfterCrash(): Promise<JobResumeResult> {
+    return this.jobManager.resumeAfterCrash();
   }
 
   async emergencyStop(): Promise<void> {
@@ -364,19 +354,6 @@ private parseGrblStatus(response: string): IGrblStatus {
     }
   }
 
-  async stopJob(): Promise<string> {
-    if (!this.connection || !this.isConnected()) {
-      throw new Error('Not connected');
-    }
-    
-    try {
-      await this.connection.send('!');
-      return 'Job stopped';
-    } catch (error) {
-      console.error('Stop job error:', error);
-      throw new Error(`Failed to stop job: ${(error as Error).message}`);
-    }
-  }
 
   async softReset(): Promise<void> {
     try {
@@ -507,22 +484,59 @@ async getInfo(): Promise<string[]> {
     console.log('Или выполните шаги вручную согласно инструкции выше');
   }
 
-  // Получение информации для отладки
+  // Public methods for recovery
+  async diagnose(): Promise<RecoveryDiagnosis> {
+    return this.recoverySystem.diagnose(this);
+  }
+
+  // Getters for state
+  getCurrentJob(): Job | null {
+    return this.jobManager.getCurrentJob();
+  }
+
+  getJobQueue(): Job[] {
+    return this.jobManager.getJobQueue();
+  }
+
+  getJobHistory(): Job[] {
+    return this.jobManager.getJobHistory();
+  }
+
+  getExecutionStats(): ExecutionStats {
+    return this.jobManager.getExecutionStats();
+  }
+
   getRecoveryInfo(): {
     currentState: RecoveryState;
     lastDiagnosis?: RecoveryDiagnosis;
-    commandJournalSize: number;
-    positionMismatch: boolean;
   } {
-    const lastDiagnosis = this.recoverySystem.getDiagnosisHistory()[0];
-    const positionMismatch = this.checkPositionMismatch();
-
     return {
       currentState: this.recoverySystem.getCurrentState(),
-      lastDiagnosis,
-      commandJournalSize: this.commandJournal.length,
-      positionMismatch
+      lastDiagnosis: this.recoverySystem.getDiagnosisHistory()[0]
     };
+  }
+
+  // G-code parsing
+  parseGCode(gcode: string): GCodeParseResult {
+    return this.parser.parse(gcode);
+  }
+
+  setMachineProfile(profile: Partial<MachineLimits>): void {
+    this.machineProfile = { ...this.machineProfile, ...profile };
+    this.jobManager.setMachineProfile(this.machineProfile);
+  }
+
+  private getDefaultMachineLimits(): MachineLimits {
+    return {
+      maxFeedRate: 3000,
+      maxSpindleSpeed: 10000,
+      travelLimits: this.safetySystem.getSoftLimits()
+    };
+  }
+
+  checkGCodeSafety(gcode: string): SafetyCheckResult {
+    const parseResult = this.parser.parse(gcode);
+    return this.parser.checkSafety(parseResult.blocks, this.machineProfile);
   }
 
   private calculateExpectedPositionChange(command: string): Partial<IPosition> | undefined {
